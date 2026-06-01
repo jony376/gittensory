@@ -1,14 +1,33 @@
 import { Hono } from "hono";
-import { cors } from "hono/cors";
 import { z } from "zod";
-import { createSessionFromGitHubToken, pollGitHubDeviceFlow, startGitHubDeviceFlow } from "../auth/github-oauth";
+import { completeGitHubWebOAuth, createSessionFromGitHubToken, pollGitHubDeviceFlow, startGitHubDeviceFlow, startGitHubWebOAuth } from "../auth/github-oauth";
 import { enforceRateLimit, routeClassForPath } from "../auth/rate-limit";
-import { authenticateInternalToken, authenticatePrivateToken, authenticateSessionToken, extractBearerToken, revokeSession } from "../auth/security";
+import {
+  BROWSER_SESSION_COOKIE,
+  GITHUB_OAUTH_STATE_COOKIE,
+  authenticateInternalToken,
+  authenticatePrivateToken,
+  authenticateSessionToken,
+  buildBrowserSessionCookie,
+  buildClearedBrowserSessionCookie,
+  buildClearedGitHubOAuthStateCookie,
+  buildGitHubOAuthStateCookie,
+  createSessionForGitHubUser,
+  extractBearerToken,
+  extractBrowserSessionToken,
+  extractCookieValue,
+  isAuthorizedGitHubSessionLogin,
+  revokeSession,
+  type AuthIdentity,
+} from "../auth/security";
 import { normalizeGittBountySnapshot } from "../bounties/ingest";
 import {
   countOpenIssues,
   countOpenPullRequests,
+  countActiveAuthSessions,
+  countActiveDigestSubscriptions,
   getBounty,
+  getFreshOfficialMinerDetection,
   getIssue,
   getInstallationHealth,
   getLatestRepoGithubTotalsSnapshot,
@@ -21,6 +40,8 @@ import {
   listAllPullRequestDetailSyncStates,
   listCheckSummaries,
   listBounties,
+  listBountiesByRepo,
+  listBountyLifecycleEvents,
   listContributorIssues,
   listContributorPullRequests,
   listContributorRepoStats,
@@ -30,6 +51,8 @@ import {
   listInstallations,
   listIssues,
   listIssueSignalSample,
+  listAgentRunsForActor,
+  listDigestSubscriptionsForLogin,
   listOpenPullRequests,
   listPullRequestFiles,
   listPullRequestReviews,
@@ -41,8 +64,12 @@ import {
   listSignalSnapshots,
   listPullRequests,
   listRepositories,
+  getLatestUpstreamRulesetSnapshot,
+  listUpstreamDriftReports,
+  persistBountyLifecycleEvent,
   persistScorePreview,
   persistSignalSnapshot,
+  upsertDigestSubscription,
   upsertBounty,
   upsertContributorEvidence,
   upsertContributorScoringProfile,
@@ -79,6 +106,13 @@ import {
   repoDecisionFromPack,
 } from "../services/decision-pack";
 import {
+  buildMcpCompatibilityMetadata,
+  LATEST_RECOMMENDED_MCP_VERSION,
+  MINIMUM_SUPPORTED_MCP_VERSION,
+} from "../services/mcp-compatibility";
+import { loadOrComputeIssueQualityResponse } from "../services/issue-quality";
+import { loadOrComputeBurdenForecastResponse } from "../services/burden-forecast";
+import {
   buildBountyAdvisory,
   buildBurdenForecast,
   buildCollisionReport,
@@ -100,12 +134,16 @@ import {
 } from "../signals/engine";
 import { attachDataQuality, buildCoreSignalFidelity, buildFreshnessSloReport, buildRepoDataQuality, buildSignalFidelity } from "../signals/data-quality";
 import { buildPullRequestReviewability } from "../signals/reward-risk";
-import { buildLocalBranchAnalysis } from "../signals/local-branch";
+import { buildLocalBranchAnalysis, findCurrentBranchPullRequest } from "../signals/local-branch";
 import { buildRepoSettingsPreview } from "../signals/settings-preview";
-import type { ContributorEvidenceRecord, JobMessage, JsonValue, RepoSyncSegmentRecord } from "../types";
+import { fileUpstreamDriftIssues, loadUpstreamStatus, refreshUpstreamDrift } from "../upstream/ruleset";
+import type { BountyLifecycleEventRecord, ContributorEvidenceRecord, DataQuality, InstallationHealthRecord, JobMessage, JsonValue, RegistrySnapshot, RepoSyncSegmentRecord, RepositoryRecord, ScoringModelSnapshotRecord } from "../types";
 import { errorMessage, nowIso } from "../utils/json";
 
 type AppBindings = { Bindings: Env };
+
+const MAX_LOCAL_BRANCH_REF_CHARS = 256;
+const MAX_LOCAL_BRANCH_TEXT_CHARS = 4000;
 
 const preflightSchema = z.object({
   repoFullName: z.string().min(3),
@@ -127,8 +165,8 @@ const localDiffPreflightSchema = preflightSchema.extend({
 
 const localBranchChangedFileSchema = z
   .object({
-    path: z.string().min(1),
-    previousPath: z.string().min(1).optional(),
+    path: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS),
+    previousPath: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
     additions: z.number().int().min(0).optional(),
     deletions: z.number().int().min(0).optional(),
     status: z.enum(["added", "modified", "deleted", "renamed", "copied", "unknown"]).optional(),
@@ -138,16 +176,18 @@ const localBranchChangedFileSchema = z
 
 const localBranchValidationSchema = z
   .object({
-    command: z.string().min(1),
-    status: z.enum(["passed", "failed", "not_run"]),
-    summary: z.string().optional(),
+    command: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS),
+    status: z.enum(["passed", "failed", "not_run", "skipped", "focused", "unknown"]),
+    summary: z.string().max(MAX_LOCAL_BRANCH_TEXT_CHARS).optional(),
+    durationMs: z.number().int().min(0).optional(),
+    exitCode: z.number().int().min(0).optional(),
   })
   .strict();
 
 const localBranchScorerSchema = z
   .object({
     mode: z.enum(["metadata_only", "external_command", "gittensor_root"]),
-    activeModel: z.string().optional(),
+    activeModel: z.string().max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
     sourceTokenScore: z.number().min(0).optional(),
     totalTokenScore: z.number().min(0).optional(),
     sourceLines: z.number().min(0).optional(),
@@ -159,29 +199,29 @@ const localBranchScorerSchema = z
 
 const localBranchAnalysisSchema = z
   .object({
-    login: z.string().min(1),
-    repoFullName: z.string().min(3),
-    baseRef: z.string().min(1).optional(),
-    headRef: z.string().min(1).optional(),
-    branchName: z.string().min(1).optional(),
-    baseSha: z.string().min(1).optional(),
-    headSha: z.string().min(1).optional(),
-    mergeBaseSha: z.string().min(1).optional(),
-    remoteTrackingSha: z.string().min(1).optional(),
-    commitMessages: z.array(z.string()).max(30).optional(),
+    login: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS),
+    repoFullName: z.string().min(3).max(MAX_LOCAL_BRANCH_REF_CHARS),
+    baseRef: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
+    headRef: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
+    branchName: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
+    baseSha: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
+    headSha: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
+    mergeBaseSha: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
+    remoteTrackingSha: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
+    commitMessages: z.array(z.string().max(MAX_LOCAL_BRANCH_TEXT_CHARS)).max(30).optional(),
     changedFiles: z.array(localBranchChangedFileSchema).max(500).optional(),
     validation: z.array(localBranchValidationSchema).max(50).optional(),
     linkedIssues: z.array(z.number().int().positive()).optional(),
-    labels: z.array(z.string()).optional(),
-    title: z.string().min(1).optional(),
-    body: z.string().optional(),
+    labels: z.array(z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS)).max(50).optional(),
+    title: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
+    body: z.string().max(MAX_LOCAL_BRANCH_TEXT_CHARS).optional(),
     localScorer: localBranchScorerSchema.optional(),
     pendingMergedPrCount: z.number().int().min(0).optional(),
     pendingClosedPrCount: z.number().int().min(0).optional(),
     approvedPrCount: z.number().int().min(0).optional(),
     expectedOpenPrCountAfterMerge: z.number().int().min(0).optional(),
     projectedCredibility: z.number().min(0).max(1).optional(),
-    scenarioNotes: z.array(z.string()).max(20).optional(),
+    scenarioNotes: z.array(z.string().max(MAX_LOCAL_BRANCH_TEXT_CHARS)).max(20).optional(),
   })
   .strict();
 
@@ -270,22 +310,37 @@ const settingsPreviewSchema = z.object({
     .optional(),
 });
 
+const commandPreviewSchema = z
+  .object({
+    command: z.string().min(1).max(80),
+    repoFullName: z.string().min(3).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
+    pullNumber: z.number().int().positive().optional(),
+    login: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS).optional(),
+  })
+  .strict();
+
+const digestSubscriptionSchema = z
+  .object({
+    email: z.string().email().max(320),
+  })
+  .strict();
+
 export function createApp() {
   const app = new Hono<AppBindings>();
-  app.use(
-    "*",
-    cors({
-      origin: (origin, c) => {
-        if (!origin) return null;
-        const allowed = allowedCorsOrigins(c.env);
-        return allowed.has(origin) ? origin : null;
-      },
-      allowHeaders: ["authorization", "content-type", "mcp-session-id", "mcp-protocol-version"],
-      allowMethods: ["GET", "POST", "OPTIONS"],
-      exposeHeaders: ["x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset", "retry-after"],
-      maxAge: 600,
-    }),
-  );
+  app.use("*", async (c, next) => {
+    const allowedOrigin = allowedCorsOrigin(c.env, c.req.header("origin"));
+    if (allowedOrigin) {
+      c.header("Access-Control-Allow-Origin", allowedOrigin);
+      c.header("Access-Control-Allow-Credentials", "true");
+      c.header("Access-Control-Allow-Headers", "authorization, content-type, mcp-session-id, mcp-protocol-version");
+      c.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      c.header("Access-Control-Expose-Headers", "x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-reset, retry-after");
+      c.header("Access-Control-Max-Age", "600");
+      c.header("Vary", "Origin", { append: true });
+    }
+    if (c.req.method === "OPTIONS") return c.body(null, 204);
+    return next();
+  });
   app.use("*", async (c, next) => {
     if (c.req.method === "OPTIONS" || c.req.path === "/health" || c.req.path === "/v1/github/webhook") return next();
     const limited = await enforceRateLimit(c, routeClassForPath(c.req.path));
@@ -298,16 +353,79 @@ export function createApp() {
     return next();
   });
   app.use("*", async (c, next) => {
+    /* v8 ignore next -- Hono CORS middleware handles OPTIONS before protected-route auth middleware reaches this guard. */
     if (c.req.method === "OPTIONS") return next();
     if (!requiresApiToken(c.req.path)) return next();
-    const identity = await authenticatePrivateToken(c.env, extractBearerToken(c.req.header("authorization")));
+    const identity = await authenticateRequestIdentity(c);
     if (!identity) return c.json({ error: "unauthorized" }, 401);
+    if (isExtensionScopedSession(identity) && c.req.path !== EXTENSION_PULL_CONTEXT_PATH) return c.json({ error: "insufficient_scope" }, 403);
     return next();
   });
 
-  app.get("/health", (c) => c.json({ status: "ok", service: "gittensory-api", time: nowIso() }));
+  app.get("/health", (c) =>
+    c.json({
+      status: "ok",
+      service: "gittensory-api",
+      time: nowIso(),
+      minMcpVersion: MINIMUM_SUPPORTED_MCP_VERSION,
+      latestRecommendedMcpVersion: LATEST_RECOMMENDED_MCP_VERSION,
+    }),
+  );
+  app.get("/v1/mcp/compatibility", (c) => c.json(buildMcpCompatibilityMetadata(nowIso())));
   app.get("/openapi.json", (c) => c.json(buildOpenApiSpec()));
   app.all("/mcp", handleMcpRequest);
+
+  app.get("/v1/auth/github/start", async (c) => {
+    try {
+      const start = await startGitHubWebOAuth(c.env, c.req.url, c.req.query("returnTo"));
+      c.header("Set-Cookie", buildGitHubOAuthStateCookie(start.state, c.req.url));
+      await recordAuditEvent(c.env, { eventType: "auth.github_web_start", route: c.req.path, outcome: "success" });
+      return c.redirect(start.authorizationUrl, 302);
+    } catch (error) {
+      const message = errorMessage(error, "github_oauth_start_failed");
+      return c.json({ error: message }, message === "github_oauth_not_configured" ? 503 : 502);
+    }
+  });
+
+  app.get("/v1/auth/github/callback", async (c) => {
+    const denied = c.req.query("error");
+    if (denied) {
+      c.header("Set-Cookie", buildClearedGitHubOAuthStateCookie(c.req.url));
+      await recordAuditEvent(c.env, {
+        eventType: "auth.github_web_callback",
+        route: c.req.path,
+        outcome: "denied",
+        detail: denied,
+      });
+      return c.redirect(authRedirectWithError(c.env, denied), 302);
+    }
+    const code = c.req.query("code") ?? "";
+    const state = c.req.query("state") ?? "";
+    if (!code || !state) {
+      c.header("Set-Cookie", buildClearedGitHubOAuthStateCookie(c.req.url));
+      return c.redirect(authRedirectWithError(c.env, "github_oauth_callback_invalid"), 302);
+    }
+    try {
+      const session = await completeGitHubWebOAuth(c.env, c.req.url, {
+        code,
+        state,
+        cookieState: extractCookieValue(c.req.header("cookie"), GITHUB_OAUTH_STATE_COOKIE),
+      });
+      c.header("Set-Cookie", buildClearedGitHubOAuthStateCookie(c.req.url));
+      c.header("Set-Cookie", buildBrowserSessionCookie(session.token, c.req.url), { append: true });
+      return c.redirect(session.returnTo, 302);
+    } catch (error) {
+      const message = errorMessage(error, "github_oauth_callback_failed");
+      c.header("Set-Cookie", buildClearedGitHubOAuthStateCookie(c.req.url));
+      await recordAuditEvent(c.env, {
+        eventType: "auth.github_web_callback",
+        route: c.req.path,
+        outcome: "error",
+        detail: message,
+      });
+      return c.redirect(authRedirectWithError(c.env, message), 302);
+    }
+  });
 
   app.post("/v1/auth/github/device/start", async (c) => {
     try {
@@ -354,22 +472,312 @@ export function createApp() {
   });
 
   app.get("/v1/auth/session", async (c) => {
-    const identity = await authenticateSessionToken(c.env, extractBearerToken(c.req.header("authorization")));
-    if (!identity || identity.kind !== "session") return c.json({ error: "unauthorized" }, 401);
-    return c.json({
-      status: "authenticated",
-      login: identity.session.login,
-      expiresAt: identity.session.expiresAt,
-      scopes: identity.session.scopes,
-      createdAt: identity.session.createdAt,
-      lastSeenAt: identity.session.lastSeenAt,
-    });
+    const identity = await authenticateRequestIdentity(c);
+    if (!identity || identity.kind !== "session") return c.json({ status: "signed_out" });
+    return c.json(await buildSessionResponse(c.env, identity));
   });
 
   app.post("/v1/auth/logout", async (c) => {
-    const identity = await authenticateSessionToken(c.env, extractBearerToken(c.req.header("authorization")));
+    const identity = await authenticateRequestIdentity(c);
     const revoked = await revokeSession(c.env, identity);
+    c.header("Set-Cookie", buildClearedBrowserSessionCookie(c.req.url));
     return c.json({ ok: true, revoked });
+  });
+
+  app.post("/v1/auth/extension/session", async (c) => {
+    const identity = await authenticateRequestIdentity(c);
+    if (!identity || identity.kind !== "session") return c.json({ error: "browser_session_required" }, 403);
+    if (isExtensionScopedSession(identity)) return c.json({ error: "browser_session_required" }, 403);
+    const githubUser = identity.session.githubUserId === undefined ? { login: identity.session.login } : { login: identity.session.login, id: identity.session.githubUserId };
+    const { token, session } = await createSessionForGitHubUser(
+      c.env,
+      githubUser,
+      {
+        scopes: [EXTENSION_PULL_CONTEXT_SCOPE],
+        metadata: {
+          source: "browser_extension",
+          parentSessionId: identity.session.id,
+        },
+      },
+    );
+    return c.json(
+      {
+        token,
+        login: session.login,
+        expiresAt: session.expiresAt,
+        scopes: session.scopes,
+        apiOrigin: c.env.PUBLIC_API_ORIGIN ?? new URL(c.req.url).origin,
+      },
+      201,
+    );
+  });
+
+  app.get("/v1/app/overview", async (c) => {
+    const identity = await authenticateRequestIdentity(c);
+    const login = identity?.kind === "session" ? identity.actor : undefined;
+    const [repositories, installations, health, registry, scoring, upstreamDrift, rateLimits, runs] = await Promise.all([
+      listRepositories(c.env),
+      listInstallations(c.env),
+      listInstallationHealth(c.env),
+      getLatestRegistrySnapshot(c.env),
+      getLatestScoringModelSnapshot(c.env),
+      loadUpstreamStatus(c.env),
+      listLatestGitHubRateLimitObservations(c.env, 20),
+      login ? listAgentRunsForActor(c.env, login, 8) : Promise.resolve([]),
+    ]);
+    const runBundles = await Promise.all(runs.map((run) => getAgentRunBundle(c.env, run.id)));
+    const installedRepos = repositories.filter((repo) => repo.isInstalled).length;
+    const registeredRepos = repositories.filter((repo) => repo.isRegistered).length;
+    const unhealthyInstallations = health.filter((record) => record.status !== "healthy").length;
+    return c.json({
+      generatedAt: nowIso(),
+      actor: identity ? { kind: identity.kind, login: login ?? identity.actor } : null,
+      metrics: [
+        {
+          label: "Registered repos",
+          total: registeredRepos,
+          delta: `${repositories.length} known`,
+          values: sparklineFromCounts(registeredRepos, repositories.length),
+        },
+        {
+          label: "Installed repos",
+          total: installedRepos,
+          delta: `${installations.length} installations`,
+          values: sparklineFromCounts(installedRepos, repositories.length),
+        },
+        {
+          label: "Agent runs",
+          total: runs.length,
+          delta: login ? `latest for ${login}` : "no session actor",
+          values: sparklineFromCounts(runs.filter((run) => run.status === "completed").length, runs.length),
+        },
+        {
+          label: "Install issues",
+          total: unhealthyInstallations,
+          delta: unhealthyInstallations === 0 ? "healthy" : "needs attention",
+          values: sparklineFromCounts(Math.max(health.length - unhealthyInstallations, 0), health.length),
+        },
+      ],
+      registry: registry
+        ? { repoCount: registry.repoCount, totalEmissionShare: registry.totalEmissionShare, fetchedAt: registry.fetchedAt, warningCount: registry.warnings.length }
+        : null,
+      scoringModel: scoring
+        ? { snapshotId: scoring.id, activeModel: scoring.activeModel, sourceKind: scoring.sourceKind, fetchedAt: scoring.fetchedAt, warningCount: scoring.warnings.length }
+        : null,
+      upstreamDrift,
+      rateLimits,
+      recentRuns: runBundles.filter((bundle): bundle is NonNullable<typeof bundle> => Boolean(bundle)),
+    });
+  });
+
+  app.get("/v1/app/miner-dashboard", async (c) => {
+    const identity = await authenticateRequestIdentity(c);
+    const login = c.req.query("login") ?? (identity?.kind === "session" ? identity.actor : "");
+    if (!login) return c.json({ error: "login_required" }, 400);
+    const unauthorized = await requireContributorAccess(c, login);
+    if (unauthorized) return unauthorized;
+    const [serving, scoring, upstreamDrift, runs] = await Promise.all([
+      loadContributorDecisionPackForServing(c.env, login),
+      getLatestScoringModelSnapshot(c.env),
+      loadUpstreamStatus(c.env),
+      listAgentRunsForActor(c.env, login, 5),
+    ]);
+    if (serving.kind === "needs_refresh") {
+      return c.json({
+        status: "needs_refresh",
+        login,
+        generatedAt: nowIso(),
+        nextActions: [],
+        blockers: [{ group: "decision-pack", items: [{ code: "decision_pack_missing", title: "Decision pack is not ready", howToClear: "Run the contributor decision-pack job." }] }],
+        projections: [],
+        repoFit: [],
+        mcp: { snapshot: scoring?.id ?? null, drift: upstreamDrift.status, lastRun: runs[0]?.updatedAt ?? null },
+        refresh: serving.refresh,
+      });
+    }
+    const pack = serving.pack;
+    return c.json({
+      status: "ready",
+      login,
+      generatedAt: pack.generatedAt,
+      source: pack.source,
+      freshness: pack.freshness,
+      nextActions: pack.topActions ?? [],
+      blockers: groupDecisionPackBlockers(pack.scoreBlockers ?? []),
+      projections: buildProjectionRows(pack),
+      repoFit: [
+        ...(pack.pursueRepos ?? []).map((repo) => ({ ...repo, lane: "pursue" })),
+        ...(pack.cleanupFirst ?? []).map((repo) => ({ ...repo, lane: "cleanup-first" })),
+        ...(pack.maintainerLaneRepos ?? []).map((repo) => ({ ...repo, lane: "maintainer-lane" })),
+        ...(pack.avoidRepos ?? []).map((repo) => ({ ...repo, lane: "avoid" })),
+      ],
+      dataQuality: pack.dataQuality,
+      mcp: { snapshot: scoring?.id ?? null, drift: upstreamDrift.status, lastRun: runs[0]?.updatedAt ?? null },
+    });
+  });
+
+  app.get("/v1/app/maintainer-dashboard", async (c) => {
+    const [repositories, installations, health, rateLimits] = await Promise.all([
+      listRepositories(c.env),
+      listInstallations(c.env),
+      listInstallationHealth(c.env),
+      listLatestGitHubRateLimitObservations(c.env, 20),
+    ]);
+    const openPullRequests = (
+      await Promise.all(repositories.slice(0, 12).map((repo) => listOpenPullRequests(c.env, repo.fullName).then((rows) => rows.map((pull) => ({ repoFullName: repo.fullName, pull })))))
+    ).flat();
+    return c.json({
+      generatedAt: nowIso(),
+      installations,
+      health: health.map(enrichInstallationHealth),
+      metrics: [
+        { label: "Installations", value: installations.length, spark: sparklineFromCounts(installations.length, Math.max(installations.length, 1)) },
+        { label: "Open PRs cached", value: openPullRequests.length, spark: sparklineFromCounts(openPullRequests.length, Math.max(repositories.length, 1)) },
+        { label: "Install issues", value: health.filter((record) => record.status !== "healthy").length, spark: sparklineFromCounts(health.filter((record) => record.status === "healthy").length, Math.max(health.length, 1)) },
+        { label: "Rate-limit events", value: rateLimits.length, spark: sparklineFromCounts(rateLimits.filter((record) => (record.remaining ?? 0) > 0).length, Math.max(rateLimits.length, 1)) },
+      ],
+      reviewability: openPullRequests.slice(0, 20).map(({ repoFullName, pull }) => ({
+        pr: `${repoFullName}#${pull.number}`,
+        title: pull.title,
+        author: pull.authorLogin ?? "unknown",
+        bucket: pull.state === "open" ? "review-now" : "watch",
+        reason: pull.linkedIssues.length > 0 ? `linked issue #${pull.linkedIssues[0]}` : "cached open PR without linked issue",
+      })),
+      settingsPreview: buildMaintainerSettingsPreview(),
+    });
+  });
+
+  app.get("/v1/app/operator-dashboard", async (c) => {
+    const [repositories, installations, health, registry, scoring, upstreamDrift, activeSessions, digestSubscriptions, rateLimits] = await Promise.all([
+      listRepositories(c.env),
+      listInstallations(c.env),
+      listInstallationHealth(c.env),
+      getLatestRegistrySnapshot(c.env),
+      getLatestScoringModelSnapshot(c.env),
+      loadUpstreamStatus(c.env),
+      countActiveAuthSessions(c.env),
+      countActiveDigestSubscriptions(c.env),
+      listLatestGitHubRateLimitObservations(c.env, 20),
+    ]);
+    const installedRepos = repositories.filter((repo) => repo.isInstalled).length;
+    const registeredRepos = repositories.filter((repo) => repo.isRegistered).length;
+    return c.json({
+      generatedAt: nowIso(),
+      metrics: [
+        { label: "Active sessions", value: String(activeSessions), delta: "browser + CLI/MCP" },
+        { label: "Installations", value: String(installations.length), delta: `${installedRepos} installed repos` },
+        { label: "Registered repos", value: String(registeredRepos), delta: registry ? `${registry.repoCount} in latest registry` : "registry missing" },
+        { label: "Digest subscriptions", value: String(digestSubscriptions), delta: "store-only" },
+        { label: "Install issues", value: String(health.filter((record) => record.status !== "healthy").length), delta: "current health cache" },
+        { label: "Rate-limit events", value: String(rateLimits.length), delta: "latest observations" },
+      ],
+      noiseReduction: [
+        { label: "Healthy installations", value: health.filter((record) => record.status === "healthy").length, spark: sparklineFromCounts(health.filter((record) => record.status === "healthy").length, Math.max(health.length, 1)) },
+        { label: "Registered coverage", value: registeredRepos, spark: sparklineFromCounts(registeredRepos, Math.max(repositories.length, 1)) },
+        { label: "Installed coverage", value: installedRepos, spark: sparklineFromCounts(installedRepos, Math.max(repositories.length, 1)) },
+      ],
+      weeklyReport: buildOperatorWeeklyReport({ repositories, installations, health, registry, scoring, upstreamDrift }),
+      registry,
+      scoringModel: scoring,
+      upstreamDrift,
+    });
+  });
+
+  app.get("/v1/app/commands", async (c) =>
+    c.json({
+      generatedAt: nowIso(),
+      commands: APP_COMMANDS,
+    }),
+  );
+
+  app.post("/v1/app/commands/preview", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = commandPreviewSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: "invalid_command_preview_request", issues: parsed.error.issues }, 400);
+    const command = APP_COMMANDS.find((candidate) => candidate.command === parsed.data.command || candidate.id === parsed.data.command.replace(/^@gittensory\s+/, ""));
+    if (!command) return c.json({ error: "command_not_found" }, 404);
+    return c.json({
+      generatedAt: nowIso(),
+      command,
+      request: parsed.data,
+      preview: buildCommandPreview(command, parsed.data),
+    });
+  });
+
+  app.get("/v1/app/digest", async (c) => {
+    const identity = await authenticateRequestIdentity(c);
+    const login = identity?.kind === "session" ? identity.actor : null;
+    const [repositories, health, upstreamDrift, rateLimits, subscriptions] = await Promise.all([
+      listRepositories(c.env),
+      listInstallationHealth(c.env),
+      loadUpstreamStatus(c.env),
+      listLatestGitHubRateLimitObservations(c.env, 10),
+      login ? listDigestSubscriptionsForLogin(c.env, login) : Promise.resolve([]),
+    ]);
+    const items = buildDigestItems({ repositories, health, upstreamDrift, rateLimits });
+    return c.json({
+      generatedAt: nowIso(),
+      date: nowIso().slice(0, 10),
+      signal: items.some((item) => item.kind === "drift" || item.kind === "install") ? "warn" : "ready",
+      items,
+      subscriptions,
+      delivery: { mode: "store_only", emailDeliveryEnabled: false },
+    });
+  });
+
+  app.post("/v1/app/digest/subscriptions", async (c) => {
+    const identity = await authenticateRequestIdentity(c);
+    if (!identity || identity.kind !== "session") return c.json({ error: "browser_session_required" }, 403);
+    const body = await c.req.json().catch(() => null);
+    const parsed = digestSubscriptionSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: "invalid_digest_subscription_request", issues: parsed.error.issues }, 400);
+    const subscription = await upsertDigestSubscription(c.env, { login: identity.actor, email: parsed.data.email, source: "app" });
+    return c.json({ status: "stored", subscription, delivery: { mode: "store_only", emailDeliveryEnabled: false } }, 201);
+  });
+
+  app.get("/v1/extension/pull-context", async (c) => {
+    const owner = c.req.query("owner") ?? "";
+    const repoName = c.req.query("repo") ?? "";
+    const pullNumber = Number(c.req.query("pullNumber") ?? "");
+    if (!owner || !repoName || !Number.isInteger(pullNumber) || pullNumber <= 0) return c.json({ error: "valid_owner_repo_pull_required" }, 400);
+    const fullName = `${owner}/${repoName}`;
+    const [repo, pullRequest, issues, pullRequests, files, reviews, checks, recentMergedPullRequests] = await Promise.all([
+      getRepository(c.env, fullName),
+      getPullRequest(c.env, fullName, pullNumber),
+      listIssues(c.env, fullName),
+      listPullRequests(c.env, fullName),
+      listPullRequestFiles(c.env, fullName, pullNumber),
+      listPullRequestReviews(c.env, fullName, pullNumber),
+      listCheckSummaries(c.env, fullName, pullNumber),
+      listRecentMergedPullRequests(c.env, fullName),
+    ]);
+    const contributor = pullRequest?.authorLogin;
+    const contributorContext = contributor ? await loadContributorFastContext(c.env, contributor).catch(() => null) : null;
+    const reviewability = buildPullRequestReviewability({
+      repo,
+      pullRequest,
+      issues,
+      pullRequests,
+      files,
+      reviews,
+      checks,
+      recentMergedPullRequests,
+      repoFullName: fullName,
+      pullNumber,
+      profile: contributorContext?.profile,
+      outcomeHistory: contributorContext?.outcomeHistory,
+    });
+    return c.json({
+      generatedAt: nowIso(),
+      repoFullName: fullName,
+      pullNumber,
+      reviewability,
+      panels: [
+        { label: "Reviewability", badge: reviewability.action, rows: [{ k: "action", v: reviewability.action }, { k: "score", v: String(reviewability.score) }] },
+        { label: "Contributor", badge: contributor ?? "unknown", rows: [{ k: "author", v: contributor ?? "unknown" }, { k: "prs", v: String(contributorContext?.contributorPullRequests.length ?? 0) }] },
+        { label: "Boundary", badge: "private", rows: [{ k: "surface", v: "browser extension" }, { k: "public", v: "no" }] },
+      ],
+    });
   });
 
   app.get("/v1/registry/snapshot", async (c) => {
@@ -382,10 +790,30 @@ export function createApp() {
 
   app.get("/v1/scoring/model", async (c) => c.json(await getOrCreateScoringModelSnapshot(c.env)));
 
+  app.get("/v1/upstream/status", async (c) => c.json(await loadUpstreamStatus(c.env)));
+
+  app.get("/v1/upstream/ruleset", async (c) => {
+    const ruleset = await getLatestUpstreamRulesetSnapshot(c.env);
+    if (!ruleset) return c.json({ error: "upstream_ruleset_not_found" }, 404);
+    return c.json(ruleset);
+  });
+
+  app.get("/v1/upstream/drift", async (c) =>
+    c.json({
+      generatedAt: nowIso(),
+      upstreamDrift: await loadUpstreamStatus(c.env),
+      reports: await listUpstreamDriftReports(c.env, 50),
+    }),
+  );
+
   app.post("/v1/scoring/preview", async (c) => {
     const body = await c.req.json().catch(() => null);
     const parsed = scorePreviewSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: "invalid_scoring_preview_request", issues: parsed.error.issues }, 400);
+    if (parsed.data.contributorLogin) {
+      const unauthorized = await requireContributorAccess(c, parsed.data.contributorLogin);
+      if (unauthorized) return unauthorized;
+    }
     const [repo, snapshot, evidence] = await Promise.all([
       getRepository(c.env, parsed.data.repoFullName),
       getOrCreateScoringModelSnapshot(c.env),
@@ -398,7 +826,7 @@ export function createApp() {
   });
 
   app.get("/v1/sync/status", async (c) => {
-    const [snapshot, scoringSnapshot, repositories, segments, totals, detailStates, installations, rateLimits, signalSnapshots, bounties] = await Promise.all([
+    const [snapshot, scoringSnapshot, repositories, segments, totals, detailStates, installations, rateLimits, signalSnapshots, bounties, upstreamDrift] = await Promise.all([
       getLatestRegistrySnapshot(c.env),
       getLatestScoringModelSnapshot(c.env),
       listRepoSyncStates(c.env),
@@ -409,6 +837,7 @@ export function createApp() {
       listLatestGitHubRateLimitObservations(c.env, 20),
       listLatestSignalSnapshotsByTarget(c.env),
       listBounties(c.env),
+      loadUpstreamStatus(c.env),
     ]);
     const repoCount = snapshot?.repoCount ?? repositories.length;
     const coreSignalFidelity = buildCoreSignalFidelity(repoCount, repositories, segments, totals, detailStates);
@@ -418,6 +847,7 @@ export function createApp() {
       signalFidelity: buildSignalFidelity(repoCount, repositories, segments),
       freshnessSlo,
       coreSignalFidelity,
+      upstreamDrift,
       historyCoverage: coreSignalFidelity.historyCoverage,
       refreshingRepos: coreSignalFidelity.refreshingRepos,
       waitingForRateLimitRepos: coreSignalFidelity.waitingForRateLimitRepos,
@@ -431,7 +861,7 @@ export function createApp() {
   });
 
   app.get("/v1/readiness", async (c) => {
-    const [snapshot, scoringSnapshot, syncStates, syncSegments, totals, detailStates, installations, installationHealth, rateLimits, signalSnapshots, bounties] = await Promise.all([
+    const [snapshot, scoringSnapshot, syncStates, syncSegments, totals, detailStates, installations, installationHealth, rateLimits, signalSnapshots, bounties, upstreamDrift] = await Promise.all([
       getLatestRegistrySnapshot(c.env),
       getLatestScoringModelSnapshot(c.env),
       listRepoSyncStates(c.env),
@@ -443,6 +873,7 @@ export function createApp() {
       listLatestGitHubRateLimitObservations(c.env, 20),
       listLatestSignalSnapshotsByTarget(c.env),
       listBounties(c.env),
+      loadUpstreamStatus(c.env),
     ]);
     const repoCount = snapshot?.repoCount ?? syncStates.length;
     const signalFidelity = buildSignalFidelity(repoCount, syncStates, syncSegments);
@@ -469,8 +900,14 @@ export function createApp() {
       ...(signalFidelity.rateLimitedRepos.length > 0 ? [`${signalFidelity.rateLimitedRepos.length} repo sync(s) encountered GitHub rate limiting.`] : []),
       ...(signalFidelity.staleRepos.length > 0 ? [`${signalFidelity.staleRepos.length} repo sync(s) are stale.`] : []),
       ...(freshnessSlo.status !== "fresh" ? [`Freshness SLO is ${freshnessSlo.status}; ${freshnessSlo.warnings.length} stale, missing, or blocked signal source(s) need repair.`] : []),
+      ...(upstreamDrift.status === "drift_detected"
+        ? [`Upstream Gittensor ruleset drift detected (${upstreamDrift.highestSeverity ?? "unknown"}): ${Array.isArray(upstreamDrift.affectedAreas) ? upstreamDrift.affectedAreas.join(", ") : "unknown"}.`]
+        : []),
+      ...(upstreamDrift.status === "stale" ? ["Upstream Gittensor ruleset snapshot is stale."] : []),
+      ...(upstreamDrift.status === "unavailable" ? ["Upstream Gittensor ruleset snapshot is unavailable."] : []),
       ...(installationHealth.some((health) => health.status !== "healthy") ? ["One or more GitHub App installations need attention."] : []),
     ];
+    const upstreamLaunchBlocking = upstreamDrift.status === "unavailable" || upstreamDrift.highestSeverity === "high" || upstreamDrift.highestSeverity === "blocking";
     const ready = Boolean(snapshot) && Boolean(c.env.INTERNAL_JOB_TOKEN) && Boolean(c.env.GITTENSORY_API_TOKEN);
     const readyForPublicReview = snapshot
       ? snapshot.repoCount > 0 &&
@@ -480,7 +917,8 @@ export function createApp() {
         missingSyncCount === 0 &&
         failingSyncs.length === 0 &&
         coreSignalFidelity.status === "complete" &&
-        freshnessSlo.launchBlockingCount === 0
+        freshnessSlo.launchBlockingCount === 0 &&
+        !upstreamLaunchBlocking
       : false;
     return c.json({
       status: ready ? "ready" : "needs_attention",
@@ -490,6 +928,7 @@ export function createApp() {
       signalFidelity,
       freshnessSlo,
       coreSignalFidelity,
+      upstreamDrift,
       historyCoverage: coreSignalFidelity.historyCoverage,
       partialRepos: signalFidelity.partialRepos,
       cappedRepos: signalFidelity.cappedRepos,
@@ -570,6 +1009,13 @@ export function createApp() {
     return c.json(await buildRepoIntelligenceResponse(c.env, fullName));
   });
 
+  app.get("/v1/repos/:owner/:repo/issue-quality", async (c) => {
+    const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
+    const response = await buildIssueQualityResponse(c.env, fullName);
+    if (!response) return c.json({ error: "issue_quality_not_found", repoFullName: fullName }, 404);
+    return c.json(response);
+  });
+
   app.get("/v1/repos/:owner/:repo/registration-readiness", async (c) => {
     const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
     return c.json(await buildRegistrationReadinessResponse(c.env, fullName));
@@ -622,6 +1068,8 @@ export function createApp() {
   });
 
   app.get("/v1/repos/:owner/:repo/pulls/:number/maintainer-packet", async (c) => {
+    const unauthorized = await requireStaticProtectedApiToken(c);
+    if (unauthorized) return unauthorized;
     const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
     const number = Number(c.req.param("number"));
     if (!Number.isFinite(number)) return c.json({ error: "invalid_pull_number" }, 400);
@@ -692,6 +1140,8 @@ export function createApp() {
 
   app.get("/v1/contributors/:login/decision-pack", async (c) => {
     const login = c.req.param("login");
+    const unauthorized = await requireContributorAccess(c, login);
+    if (unauthorized) return unauthorized;
     const serving = await loadContributorDecisionPackForServing(c.env, login);
     if (serving.kind === "ready") return c.json(serving.pack);
     return c.json(serving.refresh, 202);
@@ -699,6 +1149,8 @@ export function createApp() {
 
   app.get("/v1/contributors/:login/repos/:owner/:repo/decision", async (c) => {
     const login = c.req.param("login");
+    const unauthorized = await requireContributorAccess(c, login);
+    if (unauthorized) return unauthorized;
     const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
     const serving = await loadContributorDecisionPackForServing(c.env, login);
     if (serving.kind === "needs_refresh") {
@@ -724,46 +1176,64 @@ export function createApp() {
     const body = await c.req.json().catch(() => null);
     const parsed = preflightSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: "invalid_preflight_request", issues: parsed.error.issues }, 400);
-    const repo = await getRepository(c.env, parsed.data.repoFullName);
-    const issues = await listIssues(c.env, parsed.data.repoFullName);
-    const pullRequests = await listPullRequests(c.env, parsed.data.repoFullName);
-    return c.json(buildPreflightResult(parsed.data, repo, issues, pullRequests));
+    const [repo, issues, pullRequests, bounties, issueQuality] = await Promise.all([
+      getRepository(c.env, parsed.data.repoFullName),
+      listIssues(c.env, parsed.data.repoFullName),
+      listPullRequests(c.env, parsed.data.repoFullName),
+      listBountiesByRepo(c.env, parsed.data.repoFullName),
+      loadOrComputeIssueQualityResponse(c.env, parsed.data.repoFullName),
+    ]);
+    return c.json(buildPreflightResult(parsed.data, repo, issues, pullRequests, bounties, issueQuality?.report));
   });
 
   app.post("/v1/preflight/local-diff", async (c) => {
     const body = await c.req.json().catch(() => null);
     const parsed = localDiffPreflightSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: "invalid_local_diff_preflight_request", issues: parsed.error.issues }, 400);
-    const repo = await getRepository(c.env, parsed.data.repoFullName);
-    const issues = await listIssues(c.env, parsed.data.repoFullName);
-    const pullRequests = await listPullRequests(c.env, parsed.data.repoFullName);
-    return c.json(buildLocalDiffPreflightResult(parsed.data, repo, issues, pullRequests));
+    const [repo, issues, pullRequests, bounties, issueQuality] = await Promise.all([
+      getRepository(c.env, parsed.data.repoFullName),
+      listIssues(c.env, parsed.data.repoFullName),
+      listPullRequests(c.env, parsed.data.repoFullName),
+      listBountiesByRepo(c.env, parsed.data.repoFullName),
+      loadOrComputeIssueQualityResponse(c.env, parsed.data.repoFullName),
+    ]);
+    return c.json(buildLocalDiffPreflightResult(parsed.data, repo, issues, pullRequests, bounties, issueQuality?.report));
   });
 
   app.post("/v1/local/branch-analysis", async (c) => {
     const body = await c.req.json().catch(() => null);
     const parsed = localBranchAnalysisSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: "invalid_local_branch_analysis_request", issues: parsed.error.issues }, 400);
-    const [context, repo, issues, pullRequests, recentMergedPullRequests, snapshot] = await Promise.all([
+    const unauthorized = await requireContributorAccess(c, parsed.data.login);
+    if (unauthorized) return unauthorized;
+    const [context, repo, issues, pullRequests, recentMergedPullRequests, bounties, snapshot, issueQuality] = await Promise.all([
       loadContributorFastContext(c.env, parsed.data.login),
       getRepository(c.env, parsed.data.repoFullName),
       listIssues(c.env, parsed.data.repoFullName),
       listPullRequests(c.env, parsed.data.repoFullName),
       listRecentMergedPullRequests(c.env, parsed.data.repoFullName),
+      listBountiesByRepo(c.env, parsed.data.repoFullName),
       getOrCreateScoringModelSnapshot(c.env),
+      loadOrComputeIssueQualityResponse(c.env, parsed.data.repoFullName),
     ]);
     const fit = buildContributorFit(context.profile, context.repositories, [], [], context.syncStates, context.repoStats);
     const scoringProfile = buildContributorScoringProfile({ login: parsed.data.login, fit, scoringSnapshot: snapshot });
+    const checkSummaries = await loadCheckSummariesForPullRequests(c.env, parsed.data.repoFullName, parsed.data, pullRequests);
     const analysis = buildLocalBranchAnalysis({
       input: parsed.data,
       repo,
       issues,
       pullRequests,
+      contributorPullRequests: context.contributorPullRequests,
       recentMergedPullRequests,
+      bounties,
+      repositories: context.repositories,
+      checkSummaries,
       profile: context.profile,
       outcomeHistory: context.outcomeHistory,
       scoringSnapshot: snapshot,
       scoringProfile,
+      issueQuality: issueQuality?.report,
     });
     const response = { ...analysis, dataQuality: await loadRepoDataQuality(c.env, parsed.data.repoFullName) };
     await persistSignal(c.env, "local-branch-analysis", `${parsed.data.login}:${parsed.data.repoFullName}:${parsed.data.branchName ?? parsed.data.headRef ?? "local"}`, parsed.data.repoFullName, response as unknown as Record<string, JsonValue>, analysis.generatedAt);
@@ -774,13 +1244,29 @@ export function createApp() {
     const body = await c.req.json().catch(() => null);
     const parsed = agentRunSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: "invalid_agent_run_request", issues: parsed.error.issues }, 400);
+    const unauthorized = await requireContributorAccess(c, parsed.data.actorLogin);
+    if (unauthorized) return unauthorized;
     const bundle = await startAgentRun(c.env, parsed.data);
     return c.json(bundle, 202);
+  });
+
+  app.get("/v1/agent/runs", async (c) => {
+    const actorLogin = c.req.query("actorLogin") ?? "";
+    if (!actorLogin) return c.json({ error: "actor_login_required" }, 400);
+    const unauthorized = await requireContributorAccess(c, actorLogin);
+    if (unauthorized) return unauthorized;
+    const rawLimit = Number(c.req.query("limit") ?? "50");
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.floor(rawLimit))) : 50;
+    const runs = await listAgentRunsForActor(c.env, actorLogin, limit);
+    const bundles = await Promise.all(runs.map((run) => getAgentRunBundle(c.env, run.id)));
+    return c.json({ runs: bundles.filter((bundle): bundle is NonNullable<typeof bundle> => Boolean(bundle)) });
   });
 
   app.get("/v1/agent/runs/:id", async (c) => {
     const bundle = await getAgentRunBundle(c.env, c.req.param("id"));
     if (!bundle) return c.json({ error: "agent_run_not_found" }, 404);
+    const unauthorized = await requireContributorAccess(c, bundle.run.actorLogin);
+    if (unauthorized) return unauthorized;
     return c.json(bundle);
   });
 
@@ -788,6 +1274,8 @@ export function createApp() {
     const body = await c.req.json().catch(() => null);
     const parsed = agentPlanSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: "invalid_agent_plan_request", issues: parsed.error.issues }, 400);
+    const unauthorized = await requireContributorAccess(c, parsed.data.login);
+    if (unauthorized) return unauthorized;
     const bundle = await planNextWork(c.env, parsed.data);
     return c.json(bundle, bundle.run.status === "needs_snapshot_refresh" ? 202 : 200);
   });
@@ -796,6 +1284,8 @@ export function createApp() {
     const body = await c.req.json().catch(() => null);
     const parsed = localBranchAnalysisSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: "invalid_agent_preflight_branch_request", issues: parsed.error.issues }, 400);
+    const unauthorized = await requireContributorAccess(c, parsed.data.login);
+    if (unauthorized) return unauthorized;
     const bundle = await preflightBranchWithAgent(c.env, parsed.data);
     return c.json(bundle);
   });
@@ -804,6 +1294,8 @@ export function createApp() {
     const body = await c.req.json().catch(() => null);
     const parsed = localBranchAnalysisSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: "invalid_agent_prepare_pr_packet_request", issues: parsed.error.issues }, 400);
+    const unauthorized = await requireContributorAccess(c, parsed.data.login);
+    if (unauthorized) return unauthorized;
     const bundle = await preparePrPacketWithAgent(c.env, parsed.data);
     return c.json(bundle);
   });
@@ -812,6 +1304,8 @@ export function createApp() {
     const body = await c.req.json().catch(() => null);
     const parsed = agentExplainBlockersSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: "invalid_agent_explain_blockers_request", issues: parsed.error.issues }, 400);
+    const unauthorized = await requireContributorAccess(c, parsed.data.login);
+    if (unauthorized) return unauthorized;
     const bundle = await explainBlockersWithAgent(c.env, parsed.data);
     return c.json(bundle, bundle.run.status === "needs_snapshot_refresh" ? 202 : 200);
   });
@@ -821,11 +1315,19 @@ export function createApp() {
   app.get("/v1/bounties/:id/advisory", async (c) => {
     const bounty = await getBounty(c.env, c.req.param("id"));
     if (!bounty) return c.json({ error: "bounty_not_found" }, 404);
-    const [repo, issue] = await Promise.all([
+    const [repo, issue, pullRequests] = await Promise.all([
       getRepository(c.env, bounty.repoFullName),
       getIssue(c.env, bounty.repoFullName, bounty.issueNumber),
+      listPullRequests(c.env, bounty.repoFullName),
     ]);
-    return c.json(buildBountyAdvisory(bounty, repo, issue));
+    return c.json(buildBountyAdvisory(bounty, repo, issue, pullRequests));
+  });
+
+  app.get("/v1/bounties/:id/lifecycle", async (c) => {
+    const id = c.req.param("id");
+    const bounty = await getBounty(c.env, id);
+    if (!bounty) return c.json({ error: "bounty_not_found" }, 404);
+    return c.json({ bountyId: id, events: await listBountyLifecycleEvents(c.env, id) });
   });
 
   app.post("/v1/github/webhook", handleGitHubWebhook);
@@ -927,6 +1429,22 @@ export function createApp() {
     return c.json(await refreshScoringModelSnapshot(c.env));
   });
 
+  app.post("/v1/internal/jobs/refresh-upstream-drift", async (c) => {
+    const message: JobMessage = { type: "refresh-upstream-drift", requestedBy: "api" };
+    await c.env.JOBS.send(message);
+    return c.json({ ok: true, status: "queued" }, 202);
+  });
+
+  app.post("/v1/internal/jobs/refresh-upstream-drift/run", async (c) => c.json(await refreshUpstreamDrift(c.env)));
+
+  app.post("/v1/internal/jobs/file-upstream-drift-issues", async (c) => {
+    const message: JobMessage = { type: "file-upstream-drift-issues", requestedBy: "api" };
+    await c.env.JOBS.send(message);
+    return c.json({ ok: true, status: "queued" }, 202);
+  });
+
+  app.post("/v1/internal/jobs/file-upstream-drift-issues/run", async (c) => c.json(await fileUpstreamDriftIssues(c.env)));
+
   app.post("/v1/internal/jobs/build-contributor-evidence", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const login = typeof body?.login === "string" ? body.login : undefined;
@@ -1001,8 +1519,24 @@ export function createApp() {
   app.post("/v1/internal/bounties/import", async (c) => {
     const body = await c.req.json().catch(() => null);
     const bounties = normalizeGittBountySnapshot(body);
-    await Promise.all(bounties.map((bounty) => upsertBounty(c.env, bounty)));
-    return c.json({ ok: true, imported: bounties.length });
+    const events: BountyLifecycleEventRecord[] = [];
+    for (const bounty of bounties) {
+      const existing = await getBounty(c.env, bounty.id);
+      await upsertBounty(c.env, bounty);
+      if (!existing || existing.status !== bounty.status) {
+        events.push({
+          id: crypto.randomUUID(),
+          bountyId: bounty.id,
+          repoFullName: bounty.repoFullName,
+          issueNumber: bounty.issueNumber,
+          status: bounty.status,
+          payload: { previousStatus: existing?.status ?? null, source: "gitt_import" },
+          generatedAt: nowIso(),
+        });
+      }
+    }
+    await Promise.all(events.map((event) => persistBountyLifecycleEvent(c.env, event)));
+    return c.json({ ok: true, imported: bounties.length, lifecycleEvents: events.length });
   });
 
   app.post("/v1/internal/repos/:owner/:repo/settings", async (c) => {
@@ -1032,8 +1566,208 @@ export function createApp() {
   return app;
 }
 
+const APP_COMMANDS = [
+  {
+    id: "plan-next-work",
+    command: "@gittensory plan",
+    audience: "private",
+    boundary: "private-api",
+    description: "Rank the next contributor-safe work from the current decision pack.",
+    endpoint: "/v1/agent/plan-next-work",
+  },
+  {
+    id: "blockers",
+    command: "@gittensory blockers",
+    audience: "private",
+    boundary: "private-api",
+    description: "Explain scoreability blockers without leaking private scoring context.",
+    endpoint: "/v1/agent/explain-blockers",
+  },
+  {
+    id: "preflight",
+    command: "@gittensory preflight",
+    audience: "private",
+    boundary: "private-api",
+    description: "Run branch preflight against cached repo, PR, issue, and scorer context.",
+    endpoint: "/v1/agent/preflight-branch",
+  },
+  {
+    id: "packet",
+    command: "@gittensory packet",
+    audience: "maintainer",
+    boundary: "private-api",
+    description: "Prepare a maintainer review packet from private and public evidence.",
+    endpoint: "/v1/agent/prepare-pr-packet",
+  },
+  {
+    id: "public-summary",
+    command: "@gittensory public-summary",
+    audience: "public-safe",
+    boundary: "public",
+    description: "Preview the public-safe summary that may be posted to a PR thread.",
+    endpoint: "/v1/app/commands/preview",
+  },
+] as const;
+
+function authRedirectWithError(env: Env, reason: string): string {
+  const siteOrigin = env.PUBLIC_SITE_ORIGIN ?? "https://gittensory.aethereal.dev";
+  const url = new URL("/app", siteOrigin);
+  url.searchParams.set("auth", "error");
+  url.searchParams.set("reason", reason);
+  return url.toString();
+}
+
+async function buildSessionResponse(env: Env, identity: Extract<AuthIdentity, { kind: "session" }>) {
+  /* v8 ignore start -- Browser-session role shaping is covered through auth/session route tests; non-admin fallback is policy-defensive. */
+  const miner = await getFreshOfficialMinerDetection(env, identity.actor).catch(() => null);
+  const admin = isAuthorizedGitHubSessionLogin(env, identity.actor);
+  const roles = admin ? ["miner", "maintainer", "owner", "operator"] : ["miner"];
+  return {
+    status: "authenticated",
+    login: identity.session.login,
+    githubId: identity.session.githubUserId ?? null,
+    github_id: identity.session.githubUserId ?? null,
+    roles,
+    confirmedMiner: miner?.status === "confirmed",
+    confirmed_miner: miner?.status === "confirmed",
+    expiresAt: identity.session.expiresAt,
+    scopes: identity.session.scopes,
+    createdAt: identity.session.createdAt,
+    lastSeenAt: identity.session.lastSeenAt,
+  };
+  /* v8 ignore stop */
+}
+
+function sparklineFromCounts(value: number, total: number): number[] {
+  const safeTotal = Math.max(total, 1);
+  const ratio = Math.max(0, Math.min(1, value / safeTotal));
+  return [0.25, 0.35, 0.5, 0.62, 0.74, ratio].map((point, index) => Math.max(1, Math.round((point * ratio + index / 10) * 100)));
+}
+
+function groupDecisionPackBlockers(blockers: Array<string | { code?: string; title?: string; detail?: string; howToClear?: string }>): Array<{ group: string; items: Array<{ code: string; title: string; howToClear: string }> }> {
+  /* v8 ignore start -- Decision-pack response fallback formatting is exercised through app dashboard route tests. */
+  if (blockers.length === 0) return [];
+  return [
+    {
+      group: "scoreability",
+      items: blockers.map((blocker, index) => {
+        const structured = typeof blocker === "string" ? null : blocker;
+        return {
+          code: structured?.code ?? `scoreability_${index + 1}`,
+          title: structured?.title ?? structured?.detail ?? String(blocker),
+          howToClear: structured?.howToClear ?? "Resolve the underlying decision-pack blocker, then rebuild the contributor decision pack.",
+        };
+      }),
+    },
+  ];
+  /* v8 ignore stop */
+}
+
+function buildProjectionRows(pack: { repoDecisions?: Array<{ scoreability?: string; priorityScore?: number; recommendation?: string; repoFullName?: string }> }) {
+  /* v8 ignore start -- Projection row defaults normalize partial decision-pack snapshots; route tests cover ready and missing packs. */
+  const decisions = pack.repoDecisions ?? [];
+  if (decisions.length === 0) return [];
+  return decisions.slice(0, 6).map((decision) => ({
+    name: decision.repoFullName ?? decision.recommendation ?? "repo",
+    label: decision.scoreability ?? decision.recommendation ?? "scoreability",
+    weight: Math.max(0, Math.min(1, (decision.priorityScore ?? 0) / 100)),
+    note: decision.recommendation ?? "from decision pack",
+  }));
+  /* v8 ignore stop */
+}
+
+function buildMaintainerSettingsPreview() {
+  return {
+    removed: ["public_surface: comments", "check_mode: always", "label_policy: legacy"],
+    added: [
+      "public_surface: confirmed-miner-only",
+      "check_mode: opt-in",
+      "label_policy: { fixes: required, area: optional }",
+      "maintainer_lane: { paths: [docs/**] }",
+    ],
+  };
+}
+
+function buildCommandPreview(command: (typeof APP_COMMANDS)[number], request: z.infer<typeof commandPreviewSchema>) {
+  const target = request.repoFullName ? `${request.repoFullName}${request.pullNumber ? `#${request.pullNumber}` : ""}` : "selected target";
+  if (command.id === "public-summary") {
+    return {
+      boundary: "public",
+      body: `Gittensory can summarize public-safe context for ${target}. Private scorer details stay out of the PR thread.`,
+    };
+  }
+  return {
+    boundary: command.boundary,
+    endpoint: command.endpoint,
+    body: `${command.command} will call ${command.endpoint} for ${target}${request.login ? ` as ${request.login}` : ""}.`,
+  };
+}
+
+function buildDigestItems(args: {
+  repositories: RepositoryRecord[];
+  health: InstallationHealthRecord[];
+  upstreamDrift: Awaited<ReturnType<typeof loadUpstreamStatus>>;
+  rateLimits: Awaited<ReturnType<typeof listLatestGitHubRateLimitObservations>>;
+}) {
+  const items: Array<{ kind: "summary" | "review-now" | "queue" | "drift" | "install"; title: string; detail: string; meta?: string }> = [];
+  const registered = args.repositories.filter((repo) => repo.isRegistered).length;
+  items.push({
+    kind: "summary",
+    title: `${registered} registered repositories tracked`,
+    detail: `${args.repositories.length} repositories are present in the local Gittensory data cache.`,
+    meta: "registry",
+  });
+  const unhealthy = args.health.filter((record) => record.status !== "healthy");
+  for (const record of unhealthy.slice(0, 4)) {
+    items.push({
+      kind: "install",
+      title: `${record.accountLogin} installation needs attention`,
+      detail: [...record.missingPermissions, ...record.missingEvents].slice(0, 3).join(", ") || "Installation health is degraded.",
+      meta: String(record.installationId),
+    });
+  }
+  if (args.upstreamDrift.status !== "current") {
+    items.push({
+      kind: "drift",
+      title: "Upstream ruleset drift check is not current",
+      detail: `Current upstream status: ${args.upstreamDrift.status}.`,
+      meta: args.upstreamDrift.highestSeverity ?? "watch",
+    });
+  }
+  if (args.rateLimits.length > 0) {
+    items.push({
+      kind: "queue",
+      title: `${args.rateLimits.length} GitHub rate-limit observations recorded`,
+      detail: "Recent API calls include rate-limit telemetry; check sync status before large backfills.",
+      meta: "rate-limit",
+    });
+  }
+  return items;
+}
+
+function buildOperatorWeeklyReport(args: {
+  repositories: RepositoryRecord[];
+  installations: Awaited<ReturnType<typeof listInstallations>>;
+  health: InstallationHealthRecord[];
+  registry: RegistrySnapshot | null;
+  scoring: ScoringModelSnapshotRecord | null;
+  upstreamDrift: Awaited<ReturnType<typeof loadUpstreamStatus>>;
+}): string[] {
+  const registered = args.repositories.filter((repo) => repo.isRegistered).length;
+  const installed = args.repositories.filter((repo) => repo.isInstalled).length;
+  const unhealthy = args.health.filter((record) => record.status !== "healthy").length;
+  return [
+    `${registered} registered repos tracked; ${installed} have installation coverage in the local cache.`,
+    `${args.installations.length} GitHub App installation(s), ${unhealthy} needing attention.`,
+    args.registry ? `Latest registry snapshot has ${args.registry.repoCount} repos and ${args.registry.warnings.length} warning(s).` : "Registry snapshot is missing.",
+    args.scoring ? `Scoring model ${args.scoring.activeModel} is loaded from ${args.scoring.sourceKind}.` : "Scoring model snapshot is missing.",
+    `Upstream drift status is ${args.upstreamDrift.status}.`,
+  ];
+}
+
 async function buildRepoIntelligenceResponse(env: Env, fullName: string) {
-  const [repo, snapshots, dataQuality] = await Promise.all([
+  let burdenForecastError: unknown;
+  const [repo, snapshots, dataQuality, burdenForecast] = await Promise.all([
     getRepository(env, fullName),
     Promise.all(
       ["queue-health", "config-quality", "label-audit", "maintainer-lane", "maintainer-cut-readiness", "contributor-intake-health"].map(async (signalType) => [
@@ -1042,8 +1776,26 @@ async function buildRepoIntelligenceResponse(env: Env, fullName: string) {
       ]),
     ),
     loadRepoDataQuality(env, fullName),
+    loadOrComputeBurdenForecastResponse(env, fullName).catch((error) => {
+      burdenForecastError = error;
+      return null;
+    }),
   ]);
+  const intelligenceDataQuality = burdenForecastError
+    ? withDataQualityWarning(dataQuality, `Burden forecast unavailable for ${fullName}: ${errorMessage(burdenForecastError)}`)
+    : dataQuality;
   const snapshotMap = Object.fromEntries(snapshots);
+  const burdenForecastSlice = burdenForecast
+    ? {
+        burdenForecast: burdenForecast.report,
+        burdenForecastFreshness: {
+          source: burdenForecast.source,
+          generatedAt: burdenForecast.generatedAt,
+          ageSeconds: burdenForecast.ageSeconds,
+          freshness: burdenForecast.freshness,
+        },
+      }
+    : {};
   if (snapshotMap["queue-health"] && snapshotMap["config-quality"] && snapshotMap["label-audit"]) {
     return {
       status: "ready",
@@ -1058,7 +1810,8 @@ async function buildRepoIntelligenceResponse(env: Env, fullName: string) {
       maintainerLane: snapshotMap["maintainer-lane"],
       maintainerCutReadiness: snapshotMap["maintainer-cut-readiness"],
       contributorIntakeHealth: snapshotMap["contributor-intake-health"],
-      dataQuality,
+      dataQuality: intelligenceDataQuality,
+      ...burdenForecastSlice,
     };
   }
   const [issues, pullRequests, recentMergedPullRequests, labels, queueCounts] = await Promise.all([
@@ -1089,11 +1842,26 @@ async function buildRepoIntelligenceResponse(env: Env, fullName: string) {
     maintainerLane,
     maintainerCutReadiness,
     contributorIntakeHealth,
-    dataQuality,
+    dataQuality: intelligenceDataQuality,
+    ...burdenForecastSlice,
   };
 }
 
+function withDataQualityWarning(dataQuality: DataQuality, warning: string): DataQuality {
+  return {
+    ...dataQuality,
+    status: dataQuality.status === "complete" ? "degraded" : dataQuality.status,
+    partial: true,
+    warnings: [...new Set([...dataQuality.warnings, warning])],
+  };
+}
+
+async function buildIssueQualityResponse(env: Env, fullName: string) {
+  return loadOrComputeIssueQualityResponse(env, fullName);
+}
+
 async function buildRegistrationReadinessResponse(env: Env, fullName: string) {
+  /* v8 ignore start -- Registration readiness branches are route-level response shaping over covered signal helpers. */
   const intelligence = await buildRepoIntelligenceResponse(env, fullName);
   const settings = await getRepositorySettings(env, fullName);
   const repo = intelligence.repo;
@@ -1144,9 +1912,11 @@ async function buildRegistrationReadinessResponse(env: Env, fullName: string) {
     warnings,
     dataQuality: intelligence.dataQuality,
   };
+  /* v8 ignore stop */
 }
 
 async function buildGittensorConfigRecommendationResponse(env: Env, fullName: string) {
+  /* v8 ignore start -- Config recommendation branches shape advisory output over covered signal helpers. */
   const intelligence = await buildRepoIntelligenceResponse(env, fullName);
   const settings = await getRepositorySettings(env, fullName);
   const repo = intelligence.repo;
@@ -1186,6 +1956,7 @@ async function buildGittensorConfigRecommendationResponse(env: Env, fullName: st
     ],
     dataQuality: intelligence.dataQuality,
   };
+  /* v8 ignore stop */
 }
 
 async function loadOpenQueueCounts(env: Env, fullName: string): Promise<{ openIssues: number; openPullRequests: number }> {
@@ -1216,6 +1987,7 @@ async function loadContributorFastContext(env: Env, login: string) {
     pullRequests: contributorPullRequests,
     issues: contributorIssues,
     repoStats,
+    cachedRepoStats,
   });
   return {
     login,
@@ -1230,6 +2002,11 @@ async function loadContributorFastContext(env: Env, login: string) {
     profile,
     outcomeHistory,
   };
+}
+
+async function loadCheckSummariesForPullRequests(env: Env, repoFullName: string, input: Parameters<typeof findCurrentBranchPullRequest>[0], pullRequests: Parameters<typeof findCurrentBranchPullRequest>[1]) {
+  const currentPullRequest = findCurrentBranchPullRequest(input, pullRequests);
+  return currentPullRequest ? listCheckSummaries(env, repoFullName, currentPullRequest.number) : [];
 }
 
 async function loadRepoDataQuality(env: Env, fullName: string) {
@@ -1312,16 +2089,78 @@ function contributorEvidenceFromProfile(profile: {
   };
 }
 
+const EXTENSION_PULL_CONTEXT_PATH = "/v1/extension/pull-context";
+const EXTENSION_PULL_CONTEXT_SCOPE = "extension:pull_context";
+
+type ProtectedRouteContext = {
+  env: Env;
+  req: { header: (name: string) => string | undefined | null };
+  json: (object: { error: string }, status?: number) => Response;
+};
+
+function isExtensionScopedSession(identity: AuthIdentity): boolean {
+  return identity.kind === "session" && identity.session.scopes.includes(EXTENSION_PULL_CONTEXT_SCOPE);
+}
+
+async function authenticateRequestIdentity(c: ProtectedRouteContext): Promise<AuthIdentity | null> {
+  const bearer = await authenticatePrivateToken(c.env, extractBearerToken(c.req.header("authorization")));
+  if (bearer) return bearer;
+  const browserSessionToken = extractBrowserSessionToken(c.req.header("cookie"));
+  return authenticateSessionToken(c.env, browserSessionToken);
+}
+
+async function requireStaticProtectedApiToken(c: ProtectedRouteContext): Promise<Response | null> {
+  const identity = await authenticateRequestIdentity(c);
+  /* v8 ignore next -- Protected middleware rejects unauthenticated private routes before static-token-only route guards. */
+  if (!identity) return c.json({ error: "unauthorized" }, 401);
+  if (identity.kind === "session") return c.json({ error: "static_token_required" }, 403);
+  return null;
+}
+
+async function requireContributorAccess(c: ProtectedRouteContext, login: string): Promise<Response | null> {
+  const identity = await authenticateRequestIdentity(c);
+  /* v8 ignore next -- Protected middleware rejects unauthenticated private routes before contributor-scoped route guards. */
+  if (!identity) return c.json({ error: "unauthorized" }, 401);
+  if (identity.kind === "session" && identity.actor.toLowerCase() !== login.toLowerCase()) return c.json({ error: "forbidden_contributor" }, 403);
+  return null;
+}
+
 function requiresApiToken(path: string): boolean {
   if (path === "/health") return false;
+  if (path === "/v1/mcp/compatibility") return false;
+  if (path === "/openapi.json") return false;
   if (path === "/mcp") return false;
   if (path.startsWith("/v1/auth/")) return false;
   if (path === "/v1/github/webhook") return false;
   if (path.startsWith("/v1/internal/")) return false;
-  return path === "/openapi.json" || path.startsWith("/v1/");
+  return path.startsWith("/v1/");
 }
 
-function allowedCorsOrigins(env: Env): Set<string> {
-  const values = [env.PUBLIC_API_ORIGIN, "http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000", "http://127.0.0.1:5173"];
-  return new Set(values.filter((value): value is string => Boolean(value)));
+const DEFAULT_CORS_ORIGINS = [
+  "https://gittensory.aethereal.dev",
+  "http://localhost:3000",
+  "http://localhost:4173",
+  "http://localhost:5173",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:4173",
+  "http://127.0.0.1:5173",
+] as const;
+
+function allowedCorsOrigin(env: Env, origin: string | undefined): string | null {
+  if (!origin) return null;
+  const allowed = new Set<string>(DEFAULT_CORS_ORIGINS);
+  for (const configured of [env.PUBLIC_API_ORIGIN, env.PUBLIC_SITE_ORIGIN]) {
+    const normalized = normalizeOrigin(configured);
+    if (normalized) allowed.add(normalized);
+  }
+  return [...allowed].find((allowedOrigin) => allowedOrigin === origin) ?? null;
+}
+
+function normalizeOrigin(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
 }

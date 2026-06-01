@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createAgentRun, persistScoringModelSnapshot, persistSignalSnapshot, upsertIssueFromGitHub, upsertPullRequestFromGitHub, upsertRecentMergedPullRequest, upsertRepositoryFromGitHub } from "../../src/db/repositories";
+import { createAgentRun, persistScoringModelSnapshot, persistSignalSnapshot, upsertBounty, upsertIssueFromGitHub, upsertPullRequestFromGitHub, upsertRecentMergedPullRequest, upsertRepositoryFromGitHub } from "../../src/db/repositories";
 import {
   __agentOrchestratorInternals,
   executeAgentRun,
@@ -12,6 +12,7 @@ import {
   type AgentRunBundle,
 } from "../../src/services/agent-orchestrator";
 import { CONTRIBUTOR_DECISION_PACK_SIGNAL, type ContributorDecisionPack } from "../../src/services/decision-pack";
+import { buildPublicAgentCommandComment, parseGittensoryMentionCommand } from "../../src/github/commands";
 import { normalizeRegistryPayload } from "../../src/registry/normalize";
 import { persistRegistrySnapshot } from "../../src/registry/sync";
 import type { AgentRunRecord, JsonValue } from "../../src/types";
@@ -126,6 +127,55 @@ describe("agent orchestrator", () => {
     });
   });
 
+  it("does not fall back to cross-repo private rankings for public GitHub comments", async () => {
+    const env = createTestEnv();
+    const secretDecision = repoDecision({
+      repoFullName: "private-org/secret-alpha",
+      priorityScore: 99,
+      nextActions: ["Privately prioritize the secret-alpha patch before opening more public work."],
+      publicNextActions: [],
+    });
+    await persistDecisionPack(
+      env,
+      decisionPackFixture({
+        repoDecisions: [secretDecision],
+        topActions: [
+          {
+            ...action("open_new_direct_pr", "private-org/secret-alpha", "pursue", 99),
+            nextActions: ["Privately prioritize the secret-alpha patch before opening more public work."],
+            publicNextActions: [],
+          },
+        ],
+      }),
+    );
+
+    const publicPlan = await planNextWork(env, {
+      login: "oktofeesh1",
+      repoFullName: "public-org/installed-repo",
+      surface: "github_comment",
+      objective: "Respond to @gittensory next-action for public-org/installed-repo#101.",
+    });
+    const publicBlockers = await explainBlockersWithAgent(env, {
+      login: "oktofeesh1",
+      repoFullName: "public-org/installed-repo",
+      surface: "github_comment",
+    });
+    const comment = buildPublicAgentCommandComment({
+      command: parseGittensoryMentionCommand("@gittensory next-action")!,
+      repo: null,
+      issue: { number: 101, title: "Public PR", state: "open", pull_request: {} },
+      pullRequest: null,
+      actorKind: "maintainer",
+      bundle: publicPlan,
+    });
+
+    expect(publicPlan.actions).toHaveLength(0);
+    expect(publicBlockers.actions).toHaveLength(0);
+    expect(publicPlan.contextSnapshots[0]?.payload).toMatchObject({ selectedRepos: [] });
+    expect(comment).toContain("No public-safe context is available");
+    expect(comment).not.toMatch(/private-org\/secret-alpha|secret-alpha patch|Privately prioritize/i);
+  });
+
   it("serves a stale decision pack as a completed run with degraded data quality and a freshness warning", async () => {
     const sent: unknown[] = [];
     const env = createTestEnv({
@@ -206,8 +256,10 @@ describe("agent orchestrator", () => {
     await persistDecisionPack(env, decisionPackFixture());
 
     const bundle = await explainBlockersWithAgent(env, { login: "oktofeesh1", repoFullName: "entrius/gittensor" });
+    const mcpBundle = await explainBlockersWithAgent(env, { login: "oktofeesh1", repoFullName: "entrius/gittensor", surface: "mcp" });
 
     expect(bundle.actions).toHaveLength(1);
+    expect(mcpBundle.run.surface).toBe("mcp");
     expect(bundle.actions[0]).toMatchObject({
       actionType: "explain_score_blockers",
       status: "blocked",
@@ -471,6 +523,7 @@ describe("agent orchestrator", () => {
     expect(packet.actions).toHaveLength(1);
     expect(packet.actions[0]).toMatchObject({ actionType: "prepare_pr_packet", safetyClass: "public_safe", approvalRequired: false });
     expect(blockers.actions[0]).toMatchObject({ actionType: "explain_score_blockers", targetRepoFullName: "entrius/allways-ui" });
+    expect(JSON.stringify(preflight.actions)).toContain("linked_issue_bounty_historical");
     expect(JSON.stringify(preflight.actions)).toContain("Source upload disabled");
   });
 });
@@ -601,6 +654,7 @@ function decisionPackFixture(overrides: Partial<ContributorDecisionPack> = {}): 
       maintainerLaneRepos: ["JSONbored/awesome-claude"],
     },
     roleContexts: [],
+    opportunities: [],
     repoDecisions,
     topActions: [
       action("cleanup_existing_prs", "we-promise/sure", "cleanup_first", 94),
@@ -795,6 +849,15 @@ async function seedLocalBranchData(env: Env): Promise<void> {
     linkedIssues: [7],
     changedFiles: ["src/cache.ts"],
     payload: {},
+  });
+  await upsertBounty(env, {
+    id: "local-bounty-7",
+    repoFullName: "entrius/allways-ui",
+    issueNumber: 7,
+    status: "Completed",
+    amountText: "0.0000",
+    sourceUrl: "contract://issues/7",
+    payload: { target_alpha: "5.0000", bounty_alpha: "0.0000" },
   });
 }
 

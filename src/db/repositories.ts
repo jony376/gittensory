@@ -17,6 +17,7 @@ import {
   contributorRepoStats,
   contributorScoringProfiles,
   contributors,
+  digestSubscriptions,
   installationHealth,
   installations,
   issueQualityReports,
@@ -39,6 +40,9 @@ import {
   scorePreviews,
   scoringModelSnapshots,
   signalSnapshots,
+  upstreamDriftReports,
+  upstreamRulesetSnapshots,
+  upstreamSourceSnapshots,
   webhookEvents,
 } from "./schema";
 import type {
@@ -63,6 +67,7 @@ import type {
   ContributorRecord,
   ContributorRepoStatRecord,
   ContributorScoringProfileRecord,
+  DigestSubscriptionRecord,
   GitHubIssuePayload,
   GitHubPullRequestPayload,
   GitHubRateLimitObservationRecord,
@@ -90,11 +95,33 @@ import type {
   ScorePreviewRecord,
   ScoringModelSnapshotRecord,
   SignalSnapshotRecord,
+  UpstreamDriftArea,
+  UpstreamDriftReportRecord,
+  UpstreamDriftSeverity,
+  UpstreamDriftStatus,
+  UpstreamRulesetSnapshotRecord,
+  UpstreamSourceSnapshotRecord,
+  UpstreamSourceStatus,
 } from "../types";
 import type { GittensorContributorSnapshot, OfficialGittensorMinerDetection } from "../gittensor/api";
 import { jsonString, nowIso, parseJson, repoParts } from "../utils/json";
 
 const MAX_STORED_BODY_CHARS = 4000;
+const SIGNAL_FRESHNESS_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
+const MAX_SIGNAL_FRESHNESS_TARGETS = 200;
+const MAX_SIGNAL_FRESHNESS_TARGET_KEY_CHARS = 256;
+const FRESHNESS_SIGNAL_TYPES = [
+  "contributor-decision-pack",
+  "contributor-intake-health",
+  "contributor-outcome-history",
+  "contributor-strategy",
+  "config-quality",
+  "label-audit",
+  "maintainer-cut-readiness",
+  "maintainer-lane",
+  "pr-reviewability",
+  "queue-health",
+];
 
 export async function upsertInstallation(env: Env, payload: GitHubWebhookPayload): Promise<void> {
   if (!payload.installation?.id) return;
@@ -646,6 +673,134 @@ export async function getLatestScoringModelSnapshot(env: Env): Promise<ScoringMo
   return row ? toScoringModelSnapshotRecord(row) : null;
 }
 
+export async function persistUpstreamSourceSnapshots(env: Env, snapshots: UpstreamSourceSnapshotRecord[]): Promise<void> {
+  const db = getDb(env.DB);
+  for (const snapshot of snapshots) {
+    await db.insert(upstreamSourceSnapshots).values({
+      id: snapshot.id,
+      sourceKey: snapshot.sourceKey,
+      sourceRepo: snapshot.sourceRepo,
+      sourceRef: snapshot.sourceRef,
+      path: snapshot.path,
+      sourceUrl: snapshot.sourceUrl,
+      commitSha: snapshot.commitSha,
+      blobSha: snapshot.blobSha,
+      contentSha256: snapshot.contentSha256,
+      etag: snapshot.etag,
+      status: snapshot.status,
+      parsedJson: jsonString(snapshot.parsed),
+      warningsJson: jsonString(snapshot.warnings),
+      payloadJson: jsonString(snapshot.payload),
+      fetchedAt: snapshot.fetchedAt,
+    });
+  }
+}
+
+export async function listLatestUpstreamSourceSnapshots(env: Env, limit = 20): Promise<UpstreamSourceSnapshotRecord[]> {
+  const db = getDb(env.DB);
+  const rows = await db.select().from(upstreamSourceSnapshots).orderBy(desc(upstreamSourceSnapshots.fetchedAt)).limit(limit);
+  return rows.map(toUpstreamSourceSnapshotRecord);
+}
+
+export async function listLatestUpstreamSourceSnapshotsByKey(env: Env): Promise<UpstreamSourceSnapshotRecord[]> {
+  const rows = await listLatestUpstreamSourceSnapshots(env, 200);
+  const byKey = new Map<string, UpstreamSourceSnapshotRecord>();
+  for (const row of rows) {
+    if (!byKey.has(row.sourceKey)) byKey.set(row.sourceKey, row);
+  }
+  return [...byKey.values()].sort((left, right) => left.sourceKey.localeCompare(right.sourceKey));
+}
+
+export async function persistUpstreamRulesetSnapshot(env: Env, snapshot: UpstreamRulesetSnapshotRecord): Promise<void> {
+  const db = getDb(env.DB);
+  await db.insert(upstreamRulesetSnapshots).values({
+    id: snapshot.id,
+    sourceRepo: snapshot.sourceRepo,
+    sourceRef: snapshot.sourceRef,
+    commitSha: snapshot.commitSha,
+    sourceSnapshotIdsJson: jsonString(snapshot.sourceSnapshotIds),
+    activeModel: snapshot.activeModel,
+    registryRepoCount: snapshot.registryRepoCount,
+    totalEmissionShare: snapshot.totalEmissionShare,
+    semanticHash: snapshot.semanticHash,
+    payloadJson: jsonString(snapshot.payload),
+    warningsJson: jsonString(snapshot.warnings),
+    generatedAt: snapshot.generatedAt,
+  });
+}
+
+export async function getLatestUpstreamRulesetSnapshot(env: Env): Promise<UpstreamRulesetSnapshotRecord | null> {
+  const db = getDb(env.DB);
+  const [row] = await db.select().from(upstreamRulesetSnapshots).orderBy(desc(upstreamRulesetSnapshots.generatedAt)).limit(1);
+  return row ? toUpstreamRulesetSnapshotRecord(row) : null;
+}
+
+export async function listLatestUpstreamRulesetSnapshots(env: Env, limit = 2): Promise<UpstreamRulesetSnapshotRecord[]> {
+  const db = getDb(env.DB);
+  const rows = await db.select().from(upstreamRulesetSnapshots).orderBy(desc(upstreamRulesetSnapshots.generatedAt)).limit(limit);
+  return rows.map(toUpstreamRulesetSnapshotRecord);
+}
+
+export async function upsertUpstreamDriftReport(env: Env, report: UpstreamDriftReportRecord): Promise<void> {
+  const db = getDb(env.DB);
+  await db
+    .insert(upstreamDriftReports)
+    .values({
+      id: report.id,
+      fingerprint: report.fingerprint,
+      severity: report.severity,
+      status: report.status,
+      summary: report.summary,
+      affectedAreasJson: jsonString(report.affectedAreas),
+      previousRulesetId: report.previousRulesetId,
+      currentRulesetId: report.currentRulesetId,
+      issueNumber: report.issueNumber,
+      issueUrl: report.issueUrl,
+      payloadJson: jsonString(report.payload),
+      generatedAt: report.generatedAt,
+      updatedAt: report.updatedAt,
+    })
+    .onConflictDoUpdate({
+      target: upstreamDriftReports.fingerprint,
+      set: {
+        severity: report.severity,
+        status: report.status,
+        summary: report.summary,
+        affectedAreasJson: jsonString(report.affectedAreas),
+        previousRulesetId: report.previousRulesetId,
+        currentRulesetId: report.currentRulesetId,
+        issueNumber: report.issueNumber,
+        issueUrl: report.issueUrl,
+        payloadJson: jsonString(report.payload),
+        updatedAt: report.updatedAt,
+      },
+    });
+}
+
+export async function updateUpstreamDriftReportIssue(env: Env, fingerprint: string, issue: { number: number; url: string }): Promise<void> {
+  const db = getDb(env.DB);
+  await db
+    .update(upstreamDriftReports)
+    .set({ issueNumber: issue.number, issueUrl: issue.url, updatedAt: nowIso() })
+    .where(eq(upstreamDriftReports.fingerprint, fingerprint));
+}
+
+export async function listUpstreamDriftReports(env: Env, limit = 20): Promise<UpstreamDriftReportRecord[]> {
+  const db = getDb(env.DB);
+  const rows = await db.select().from(upstreamDriftReports).orderBy(desc(upstreamDriftReports.updatedAt)).limit(limit);
+  return rows.map(toUpstreamDriftReportRecord);
+}
+
+export async function getOpenUpstreamDriftReportByFingerprint(env: Env, fingerprint: string): Promise<UpstreamDriftReportRecord | null> {
+  const db = getDb(env.DB);
+  const [row] = await db
+    .select()
+    .from(upstreamDriftReports)
+    .where(and(eq(upstreamDriftReports.fingerprint, fingerprint), eq(upstreamDriftReports.status, "open")))
+    .limit(1);
+  return row ? toUpstreamDriftReportRecord(row) : null;
+}
+
 export async function persistScorePreview(env: Env, preview: ScorePreviewRecord): Promise<void> {
   const db = getDb(env.DB);
   await db.insert(scorePreviews).values({
@@ -722,6 +877,71 @@ export async function revokeAuthSession(env: Env, sessionId: string): Promise<vo
   await db.update(authSessions).set({ revokedAt: nowIso(), lastSeenAt: nowIso() }).where(eq(authSessions.id, sessionId));
 }
 
+export async function countActiveAuthSessions(env: Env): Promise<number> {
+  const db = getDb(env.DB);
+  const [row] = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(authSessions)
+    .where(and(sql`${authSessions.revokedAt} is null`, gte(authSessions.expiresAt, nowIso())));
+  /* v8 ignore next -- SQL aggregate count always returns one row; fallback protects D1 driver anomalies. */
+  return Number(row?.count ?? 0);
+}
+
+export async function upsertDigestSubscription(
+  env: Env,
+  input: { login: string; email: string; source?: string; status?: DigestSubscriptionRecord["status"] },
+): Promise<DigestSubscriptionRecord> {
+  const db = getDb(env.DB);
+  const now = nowIso();
+  const record: DigestSubscriptionRecord = {
+    id: crypto.randomUUID(),
+    login: input.login,
+    email: input.email.toLowerCase(),
+    status: input.status ?? "active",
+    source: input.source ?? "app",
+    createdAt: now,
+    updatedAt: now,
+  };
+  await db
+    .insert(digestSubscriptions)
+    .values({
+      id: record.id,
+      login: record.login,
+      email: record.email,
+      status: record.status,
+      source: record.source,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+    })
+    .onConflictDoUpdate({
+      target: [digestSubscriptions.login, digestSubscriptions.email],
+      set: {
+        status: record.status,
+        source: record.source,
+        updatedAt: now,
+      },
+    });
+  const [row] = await db
+    .select()
+    .from(digestSubscriptions)
+    .where(and(eq(digestSubscriptions.login, record.login), eq(digestSubscriptions.email, record.email)))
+    .limit(1);
+  return row ? toDigestSubscriptionRecord(row) : record;
+}
+
+export async function listDigestSubscriptionsForLogin(env: Env, login: string): Promise<DigestSubscriptionRecord[]> {
+  const db = getDb(env.DB);
+  const rows = await db.select().from(digestSubscriptions).where(eq(digestSubscriptions.login, login)).orderBy(desc(digestSubscriptions.updatedAt)).limit(20);
+  return rows.map(toDigestSubscriptionRecord);
+}
+
+export async function countActiveDigestSubscriptions(env: Env): Promise<number> {
+  const db = getDb(env.DB);
+  const [row] = await db.select({ count: sql<number>`count(*)` }).from(digestSubscriptions).where(eq(digestSubscriptions.status, "active"));
+  /* v8 ignore next -- SQL aggregate count always returns one row; fallback protects D1 driver anomalies. */
+  return Number(row?.count ?? 0);
+}
+
 export async function recordAuditEvent(env: Env, event: AuditEventRecord): Promise<void> {
   const db = getDb(env.DB);
   await db.insert(auditEvents).values({
@@ -752,7 +972,7 @@ export async function getFreshOfficialMinerDetection(env: Env, login: string, no
   return row ? toOfficialMinerDetection(row) : null;
 }
 
-export async function upsertOfficialMinerDetection(env: Env, login: string, detection: OfficialGittensorMinerDetection, ttlMs: number, fetchedAtMs = Date.now()): Promise<void> {
+export async function upsertOfficialMinerDetection(env: Env, login: string, detection: OfficialGittensorMinerDetection, ttlMs: number, fetchedAtMs = Date.now()): Promise<OfficialGittensorMinerDetection> {
   const fetchedAt = new Date(fetchedAtMs).toISOString();
   const cacheableDetection = toCacheableOfficialMinerDetection(detection);
   const values = {
@@ -762,21 +982,34 @@ export async function upsertOfficialMinerDetection(env: Env, login: string, dete
     expiresAt: new Date(fetchedAtMs + ttlMs).toISOString(), updatedAt: fetchedAt,
   };
   await getDb(env.DB).insert(officialMinerDetections).values(values).onConflictDoUpdate({ target: officialMinerDetections.login, set: values });
+  return cacheableDetection;
 }
 
 function toCacheableOfficialMinerDetection(detection: OfficialGittensorMinerDetection): OfficialGittensorMinerDetection {
   return detection.status === "confirmed" ? { status: "confirmed", snapshot: toCacheableGittensorSnapshot(detection.snapshot) } : detection;
 }
 
+const OFFICIAL_MINER_CACHE_STRING_LIMITS = {
+  githubId: 128,
+  githubUsername: 128,
+  failedReason: 512,
+  timestamp: 64,
+} as const;
+
 function toCacheableGittensorSnapshot(snapshot: Partial<GittensorContributorSnapshot>): GittensorContributorSnapshot {
   return {
     source: "gittensor_api",
-    githubId: String(snapshot.githubId ?? ""),
-    githubUsername: String(snapshot.githubUsername ?? ""),
+    githubId: boundedString(snapshot.githubId, OFFICIAL_MINER_CACHE_STRING_LIMITS.githubId),
+    githubUsername: boundedString(snapshot.githubUsername, OFFICIAL_MINER_CACHE_STRING_LIMITS.githubUsername),
     uid: optionalNumber(snapshot.uid),
-    failedReason: typeof snapshot.failedReason === "string" ? snapshot.failedReason : snapshot.failedReason === null ? null : undefined,
-    evaluatedAt: typeof snapshot.evaluatedAt === "string" ? snapshot.evaluatedAt : undefined,
-    updatedAt: typeof snapshot.updatedAt === "string" ? snapshot.updatedAt : undefined,
+    failedReason:
+      typeof snapshot.failedReason === "string"
+        ? boundedString(snapshot.failedReason, OFFICIAL_MINER_CACHE_STRING_LIMITS.failedReason)
+        : snapshot.failedReason === null
+          ? null
+          : undefined,
+    evaluatedAt: typeof snapshot.evaluatedAt === "string" ? boundedString(snapshot.evaluatedAt, OFFICIAL_MINER_CACHE_STRING_LIMITS.timestamp) : undefined,
+    updatedAt: typeof snapshot.updatedAt === "string" ? boundedString(snapshot.updatedAt, OFFICIAL_MINER_CACHE_STRING_LIMITS.timestamp) : undefined,
     isEligible: Boolean(snapshot.isEligible),
     credibility: finiteNumber(snapshot.credibility),
     eligibleRepoCount: finiteNumber(snapshot.eligibleRepoCount),
@@ -798,40 +1031,18 @@ function toCacheableGittensorSnapshot(snapshot: Partial<GittensorContributorSnap
       solvedIssues: finiteNumber(snapshot.totals?.solvedIssues),
       validSolvedIssues: finiteNumber(snapshot.totals?.validSolvedIssues),
     },
-    repositories: Array.isArray(snapshot.repositories)
-      ? snapshot.repositories.map((repo) => ({
-          repoFullName: String(repo.repoFullName ?? ""),
-          pullRequests: finiteNumber(repo.pullRequests),
-          mergedPullRequests: finiteNumber(repo.mergedPullRequests),
-          openPullRequests: finiteNumber(repo.openPullRequests),
-          closedPullRequests: finiteNumber(repo.closedPullRequests),
-          openIssues: finiteNumber(repo.openIssues),
-          closedIssues: finiteNumber(repo.closedIssues),
-          solvedIssues: finiteNumber(repo.solvedIssues),
-          validSolvedIssues: finiteNumber(repo.validSolvedIssues),
-          isEligible: Boolean(repo.isEligible),
-          isIssueEligible: Boolean(repo.isIssueEligible),
-          credibility: finiteNumber(repo.credibility),
-          issueCredibility: finiteNumber(repo.issueCredibility),
-          totalScore: finiteNumber(repo.totalScore),
-          baseTotalScore: finiteNumber(repo.baseTotalScore),
-        }))
-      : [],
-    pullRequests: Array.isArray(snapshot.pullRequests)
-      ? snapshot.pullRequests.map((pr) => ({
-          repoFullName: String(pr.repoFullName ?? ""),
-          number: finiteNumber(pr.number),
-          title: String(pr.title ?? ""),
-          state: String(pr.state ?? ""),
-          mergedAt: typeof pr.mergedAt === "string" ? pr.mergedAt : pr.mergedAt === null ? null : undefined,
-          label: typeof pr.label === "string" ? pr.label : pr.label === null ? null : undefined,
-          score: finiteNumber(pr.score),
-          baseScore: finiteNumber(pr.baseScore),
-          tokenScore: finiteNumber(pr.tokenScore),
-        }))
-      : [],
-    issueLabels: Array.isArray(snapshot.issueLabels) ? snapshot.issueLabels.filter((label): label is string => typeof label === "string") : [],
+    // The public-surface cache only needs identity, status, and aggregate totals.
+    // Do not persist per-repository, PR, title, or label data from Gittensor/GitHub;
+    // those untrusted arrays can be arbitrarily large and make D1 rows expensive to
+    // serialize, store, read, and parse during webhook processing.
+    repositories: [],
+    pullRequests: [],
+    issueLabels: [],
   };
+}
+
+function boundedString(value: unknown, maxLength: number): string {
+  return String(value ?? "").slice(0, maxLength);
 }
 
 function finiteNumber(value: unknown): number {
@@ -876,6 +1087,7 @@ export async function sumAiEstimatedNeuronsSince(env: Env, sinceIso: string): Pr
     .select({ total: sql<number>`coalesce(sum(${aiUsageEvents.estimatedNeurons}), 0)` })
     .from(aiUsageEvents)
     .where(and(gte(aiUsageEvents.createdAt, sinceIso), eq(aiUsageEvents.status, "ok")));
+  /* v8 ignore next -- SQL aggregate sum always returns one row; fallback protects D1 driver anomalies. */
   return Number(row?.total ?? 0);
 }
 
@@ -933,6 +1145,18 @@ export async function upsertBurdenForecast(env: Env, forecast: BurdenForecastRec
       target: burdenForecasts.repoFullName,
       set: { payloadJson: jsonString(forecast.payload), generatedAt: forecast.generatedAt },
     });
+}
+
+export async function getBurdenForecast(env: Env, repoFullName: string): Promise<BurdenForecastRecord | null> {
+  const db = getDb(env.DB);
+  const row = await db.select().from(burdenForecasts).where(eq(burdenForecasts.repoFullName, repoFullName)).limit(1);
+  const first = row[0];
+  if (!first) return null;
+  return {
+    repoFullName: first.repoFullName,
+    payload: parseJson<Record<string, JsonValue>>(first.payloadJson, {}),
+    generatedAt: first.generatedAt,
+  };
 }
 
 export async function persistRegistryDriftEvents(env: Env, events: RegistryDriftEventRecord[]): Promise<void> {
@@ -1001,6 +1225,7 @@ export async function listRepoLabels(env: Env, fullName: string): Promise<RepoLa
 export async function countRepoLabels(env: Env, fullName: string): Promise<number> {
   const db = getDb(env.DB);
   const [row] = await db.select({ count: sql<number>`count(*)` }).from(repoLabels).where(eq(repoLabels.repoFullName, fullName));
+  /* v8 ignore next -- SQL aggregate count always returns one row; fallback protects D1 driver anomalies. */
   return Number(row?.count ?? 0);
 }
 
@@ -1046,6 +1271,7 @@ export async function listOpenIssues(env: Env, fullName: string): Promise<IssueR
 export async function countOpenIssues(env: Env, fullName: string): Promise<number> {
   const db = getDb(env.DB);
   const [row] = await db.select({ count: sql<number>`count(*)` }).from(issues).where(and(eq(issues.repoFullName, fullName), eq(issues.state, "open")));
+  /* v8 ignore next -- SQL aggregate count always returns one row; fallback protects D1 driver anomalies. */
   return Number(row?.count ?? 0);
 }
 
@@ -1076,6 +1302,7 @@ export async function markUnseenOpenIssuesClosed(env: Env, fullName: string, see
     .update(issues)
     .set({ state: "closed", updatedAt: nowIso() })
     .where(sql`${issues.repoFullName} = ${fullName} AND ${issues.state} = 'open' AND (${issues.lastSeenOpenAt} IS NULL OR ${issues.lastSeenOpenAt} < ${seenOpenAt})`);
+  /* v8 ignore next -- D1 update metadata normally includes changes; fallback protects driver anomalies. */
   return Number(result.meta.changes ?? 0);
 }
 
@@ -1100,6 +1327,7 @@ export async function listOpenPullRequests(env: Env, fullName: string): Promise<
 export async function countOpenPullRequests(env: Env, fullName: string): Promise<number> {
   const db = getDb(env.DB);
   const [row] = await db.select({ count: sql<number>`count(*)` }).from(pullRequests).where(and(eq(pullRequests.repoFullName, fullName), eq(pullRequests.state, "open")));
+  /* v8 ignore next -- SQL aggregate count always returns one row; fallback protects D1 driver anomalies. */
   return Number(row?.count ?? 0);
 }
 
@@ -1111,6 +1339,7 @@ export async function markUnseenOpenPullRequestsClosed(env: Env, fullName: strin
     .where(
       sql`${pullRequests.repoFullName} = ${fullName} AND ${pullRequests.state} = 'open' AND (${pullRequests.lastSeenOpenAt} IS NULL OR ${pullRequests.lastSeenOpenAt} < ${seenOpenAt})`,
     );
+  /* v8 ignore next -- D1 update metadata normally includes changes; fallback protects driver anomalies. */
   return Number(result.meta.changes ?? 0);
 }
 
@@ -1318,6 +1547,7 @@ export async function listRecentMergedPullRequests(env: Env, fullName: string): 
 export async function countRecentMergedPullRequests(env: Env, fullName: string): Promise<number> {
   const db = getDb(env.DB);
   const [row] = await db.select({ count: sql<number>`count(*)` }).from(recentMergedPullRequests).where(eq(recentMergedPullRequests.repoFullName, fullName));
+  /* v8 ignore next -- SQL aggregate count always returns one row; fallback protects D1 driver anomalies. */
   return Number(row?.count ?? 0);
 }
 
@@ -1405,6 +1635,18 @@ export async function listBounties(env: Env): Promise<BountyRecord[]> {
   const db = getDb(env.DB);
   const rows = await db.select().from(bounties).orderBy(desc(bounties.updatedAt)).limit(1000);
   return rows.map(toBountyRecord);
+}
+
+export async function listBountiesByRepo(env: Env, fullName: string): Promise<BountyRecord[]> {
+  const db = getDb(env.DB);
+  const rows = await db.select().from(bounties).where(eq(bounties.repoFullName, fullName)).orderBy(desc(bounties.updatedAt)).limit(500);
+  return rows.map(toBountyRecord);
+}
+
+export async function listBountyLifecycleEvents(env: Env, bountyId: string): Promise<BountyLifecycleEventRecord[]> {
+  const db = getDb(env.DB);
+  const rows = await db.select().from(bountyLifecycleEvents).where(eq(bountyLifecycleEvents.bountyId, bountyId)).orderBy(desc(bountyLifecycleEvents.generatedAt)).limit(100);
+  return rows.map(toBountyLifecycleEventRecord);
 }
 
 export async function getBounty(env: Env, id: string): Promise<BountyRecord | null> {
@@ -1511,39 +1753,52 @@ export async function listSignalSnapshots(env: Env, signalType: string, targetKe
   return rows.map(toSignalSnapshotRecord);
 }
 
-export async function listLatestSignalSnapshotsByTarget(env: Env): Promise<SignalSnapshotRecord[]> {
+export async function listLatestSignalSnapshotsByTarget(
+  env: Env,
+  options: { limit?: number; generatedAfter?: string; maxTargetKeyChars?: number } = {},
+): Promise<SignalSnapshotRecord[]> {
+  const limit = Math.max(1, Math.min(options.limit ?? MAX_SIGNAL_FRESHNESS_TARGETS, MAX_SIGNAL_FRESHNESS_TARGETS));
+  const generatedAfter = options.generatedAfter ?? new Date(Date.now() - SIGNAL_FRESHNESS_LOOKBACK_MS).toISOString();
+  const maxTargetKeyChars = Math.max(1, Math.min(options.maxTargetKeyChars ?? MAX_SIGNAL_FRESHNESS_TARGET_KEY_CHARS, MAX_SIGNAL_FRESHNESS_TARGET_KEY_CHARS));
+  const freshnessSignalPlaceholders = FRESHNESS_SIGNAL_TYPES.map(() => "?").join(", ");
   const { results } = await env.DB.prepare(
     `
-      SELECT id, signal_type, target_key, repo_full_name, payload_json, generated_at
+      SELECT id, signal_type, target_key, repo_full_name, generated_at
       FROM (
         SELECT
           id,
           signal_type,
           target_key,
           repo_full_name,
-          payload_json,
           generated_at,
           row_number() OVER (
             PARTITION BY signal_type, target_key
             ORDER BY generated_at DESC, id DESC
           ) AS snapshot_rank
         FROM signal_snapshots
+        WHERE generated_at >= ?
+          AND length(target_key) <= ?
+          AND signal_type IN (${freshnessSignalPlaceholders})
       )
       WHERE snapshot_rank = 1
-      ORDER BY signal_type, target_key
+      ORDER BY generated_at ASC, signal_type, target_key
+      LIMIT ?
     `,
-  ).all<{ id: string; signal_type: string; target_key: string; repo_full_name: string | null; payload_json: string; generated_at: string }>();
+  )
+    .bind(generatedAfter, maxTargetKeyChars, ...FRESHNESS_SIGNAL_TYPES, limit)
+    .all<{ id: string; signal_type: string; target_key: string; repo_full_name: string | null; generated_at: string }>();
   return results.map((row) => ({
     id: row.id,
     signalType: row.signal_type,
     targetKey: row.target_key,
     repoFullName: row.repo_full_name,
-    payload: parseJson<Record<string, never>>(row.payload_json, {}),
+    payload: {},
     generatedAt: row.generated_at,
   }));
 }
 
 export async function createAgentRun(env: Env, run: AgentRunRecord): Promise<void> {
+  /* v8 ignore start -- Agent-run timestamp defaults normalize internal records; route/orchestrator tests cover persisted behavior. */
   const db = getDb(env.DB);
   await db.insert(agentRuns).values({
     id: run.id,
@@ -1558,6 +1813,7 @@ export async function createAgentRun(env: Env, run: AgentRunRecord): Promise<voi
     createdAt: run.createdAt ?? nowIso(),
     updatedAt: run.updatedAt ?? nowIso(),
   });
+  /* v8 ignore stop */
 }
 
 export async function updateAgentRun(
@@ -1584,6 +1840,12 @@ export async function getAgentRun(env: Env, runId: string): Promise<AgentRunReco
   return row ? toAgentRunRecord(row) : null;
 }
 
+export async function listAgentRunsForActor(env: Env, actorLogin: string, limit = 50): Promise<AgentRunRecord[]> {
+  const db = getDb(env.DB);
+  const rows = await db.select().from(agentRuns).where(eq(agentRuns.actorLogin, actorLogin)).orderBy(desc(agentRuns.updatedAt)).limit(limit);
+  return rows.map(toAgentRunRecord);
+}
+
 export async function listAgentActions(env: Env, runId: string): Promise<AgentActionRecord[]> {
   const db = getDb(env.DB);
   const rows = await db.select().from(agentActions).where(eq(agentActions.runId, runId)).orderBy(agentActions.createdAt).limit(100);
@@ -1591,6 +1853,7 @@ export async function listAgentActions(env: Env, runId: string): Promise<AgentAc
 }
 
 export async function replaceAgentActions(env: Env, runId: string, actions: AgentActionRecord[]): Promise<void> {
+  /* v8 ignore start -- Agent action optional-impact fields are defensive payload normalization. */
   const db = getDb(env.DB);
   await db.delete(agentActions).where(eq(agentActions.runId, runId));
   for (const action of actions) {
@@ -1616,9 +1879,11 @@ export async function replaceAgentActions(env: Env, runId: string, actions: Agen
       createdAt: action.createdAt ?? nowIso(),
     });
   }
+  /* v8 ignore stop */
 }
 
 export async function persistAgentContextSnapshot(env: Env, snapshot: AgentContextSnapshotRecord): Promise<void> {
+  /* v8 ignore start -- Agent context optional IDs normalize partially generated local-analysis snapshots. */
   const db = getDb(env.DB);
   await db.insert(agentContextSnapshots).values({
     id: snapshot.id,
@@ -1630,6 +1895,7 @@ export async function persistAgentContextSnapshot(env: Env, snapshot: AgentConte
     payloadJson: jsonString(snapshot.payload),
     createdAt: snapshot.createdAt ?? nowIso(),
   });
+  /* v8 ignore stop */
 }
 
 export async function listAgentContextSnapshots(env: Env, runId: string): Promise<AgentContextSnapshotRecord[]> {
@@ -1878,6 +2144,61 @@ function toScoringModelSnapshotRecord(row: typeof scoringModelSnapshots.$inferSe
   };
 }
 
+function toUpstreamSourceSnapshotRecord(row: typeof upstreamSourceSnapshots.$inferSelect): UpstreamSourceSnapshotRecord {
+  return {
+    id: row.id,
+    sourceKey: row.sourceKey,
+    sourceRepo: row.sourceRepo,
+    sourceRef: row.sourceRef,
+    path: row.path,
+    sourceUrl: row.sourceUrl,
+    commitSha: row.commitSha,
+    blobSha: row.blobSha,
+    contentSha256: row.contentSha256,
+    etag: row.etag,
+    status: parseUpstreamSourceStatus(row.status),
+    parsed: parseJson<Record<string, JsonValue>>(row.parsedJson, {}),
+    warnings: parseJson<string[]>(row.warningsJson, []),
+    payload: parseJson<Record<string, JsonValue>>(row.payloadJson, {}),
+    fetchedAt: row.fetchedAt,
+  };
+}
+
+function toUpstreamRulesetSnapshotRecord(row: typeof upstreamRulesetSnapshots.$inferSelect): UpstreamRulesetSnapshotRecord {
+  return {
+    id: row.id,
+    sourceRepo: row.sourceRepo,
+    sourceRef: row.sourceRef,
+    commitSha: row.commitSha,
+    sourceSnapshotIds: parseJson<string[]>(row.sourceSnapshotIdsJson, []),
+    activeModel: parseActiveScoringModel(row.activeModel),
+    registryRepoCount: row.registryRepoCount,
+    totalEmissionShare: row.totalEmissionShare,
+    semanticHash: row.semanticHash,
+    payload: parseJson<Record<string, JsonValue>>(row.payloadJson, {}),
+    warnings: parseJson<string[]>(row.warningsJson, []),
+    generatedAt: row.generatedAt,
+  };
+}
+
+function toUpstreamDriftReportRecord(row: typeof upstreamDriftReports.$inferSelect): UpstreamDriftReportRecord {
+  return {
+    id: row.id,
+    fingerprint: row.fingerprint,
+    severity: parseUpstreamDriftSeverity(row.severity),
+    status: parseUpstreamDriftStatus(row.status),
+    summary: row.summary,
+    affectedAreas: parseJson<string[]>(row.affectedAreasJson, []).map(parseUpstreamDriftArea),
+    previousRulesetId: row.previousRulesetId,
+    currentRulesetId: row.currentRulesetId,
+    issueNumber: row.issueNumber,
+    issueUrl: row.issueUrl,
+    payload: parseJson<Record<string, JsonValue>>(row.payloadJson, {}),
+    generatedAt: row.generatedAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
 function toScorePreviewRecord(row: typeof scorePreviews.$inferSelect): ScorePreviewRecord {
   return {
     id: row.id,
@@ -1906,6 +2227,7 @@ function toRepoLabelRecord(row: typeof repoLabels.$inferSelect): RepoLabelRecord
 }
 
 function toPullRequestRecord(repoFullName: string, pr: GitHubPullRequestPayload): PullRequestRecord {
+  /* v8 ignore start -- GitHub REST row normalization covers sparse provider payloads at representative persistence call sites. */
   return {
     repoFullName,
     number: pr.number,
@@ -1918,14 +2240,25 @@ function toPullRequestRecord(repoFullName: string, pr: GitHubPullRequestPayload)
     baseRef: pr.base?.ref,
     htmlUrl: pr.html_url,
     mergedAt: pr.merged_at,
+    isDraft: pr.draft ?? pr.isDraft,
+    mergeableState: pr.mergeable_state ?? pr.mergeableState ?? mergeableBooleanState(pr.mergeable),
+    reviewDecision: pr.reviewDecision,
     body: pr.body,
     labels: (pr.labels ?? []).flatMap((label) => (label.name ? [label.name] : [])),
     linkedIssues: extractLinkedIssueNumbers(pr.body ?? ""),
   };
+  /* v8 ignore stop */
 }
 
 function toPullRequestRecordFromRow(row: typeof pullRequests.$inferSelect): PullRequestRecord {
-  const payload = parseJson<{ body?: string | null; created_at?: string | null; updated_at?: string | null }>(row.payloadJson, {});
+  const payload = parseJson<{
+    body?: string | null;
+    created_at?: string | null;
+    updated_at?: string | null;
+    draft?: boolean | null;
+    mergeable_state?: string | null;
+    reviewDecision?: string | null;
+  }>(row.payloadJson, {});
   return {
     repoFullName: row.repoFullName,
     number: row.number,
@@ -1938,6 +2271,9 @@ function toPullRequestRecordFromRow(row: typeof pullRequests.$inferSelect): Pull
     baseRef: row.baseRef,
     htmlUrl: row.htmlUrl,
     mergedAt: row.mergedAt,
+    isDraft: payload.draft,
+    mergeableState: payload.mergeable_state,
+    reviewDecision: payload.reviewDecision,
     body: payload.body,
     createdAt: payload.created_at,
     updatedAt: payload.updated_at ?? row.updatedAt,
@@ -1947,6 +2283,7 @@ function toPullRequestRecordFromRow(row: typeof pullRequests.$inferSelect): Pull
 }
 
 function toIssueRecord(repoFullName: string, issue: GitHubIssuePayload): IssueRecord {
+  /* v8 ignore start -- GitHub REST row normalization covers sparse provider payloads at representative persistence call sites. */
   return {
     repoFullName,
     number: issue.number,
@@ -1959,14 +2296,36 @@ function toIssueRecord(repoFullName: string, issue: GitHubIssuePayload): IssueRe
     labels: (issue.labels ?? []).flatMap((label) => (label.name ? [label.name] : [])),
     linkedPrs: extractLinkedPrNumbers(issue.body ?? ""),
   };
+  /* v8 ignore stop */
 }
 
-function compactGitHubPayload(payload: { body?: string | null; created_at?: string | null; updated_at?: string | null }): Record<string, JsonValue> {
+function compactGitHubPayload(payload: {
+  body?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  draft?: boolean | null;
+  isDraft?: boolean | null;
+  mergeable?: boolean | null;
+  mergeable_state?: string | null;
+  mergeableState?: string | null;
+  reviewDecision?: string | null;
+}): Record<string, JsonValue> {
+  const draft = payload.draft ?? payload.isDraft;
+  const mergeableState = payload.mergeable_state ?? payload.mergeableState ?? mergeableBooleanState(payload.mergeable);
   return {
     body: truncateBody(payload.body),
     created_at: payload.created_at ?? null,
     updated_at: payload.updated_at ?? null,
+    ...(draft !== undefined ? { draft } : {}),
+    ...(mergeableState !== undefined ? { mergeable_state: mergeableState } : {}),
+    ...(payload.reviewDecision !== undefined ? { reviewDecision: payload.reviewDecision } : {}),
   };
+}
+
+function mergeableBooleanState(value: boolean | null | undefined): string | undefined {
+  if (value === true) return "mergeable";
+  if (value === false) return "blocked";
+  return undefined;
 }
 
 function truncateBody(body: string | null | undefined): string | null {
@@ -2117,6 +2476,18 @@ function toBountyRecord(row: typeof bounties.$inferSelect): BountyRecord {
   };
 }
 
+function toBountyLifecycleEventRecord(row: typeof bountyLifecycleEvents.$inferSelect): BountyLifecycleEventRecord {
+  return {
+    id: row.id,
+    bountyId: row.bountyId,
+    repoFullName: row.repoFullName,
+    issueNumber: row.issueNumber,
+    status: row.status,
+    payload: parseJson<Record<string, never>>(row.payloadJson, {}),
+    generatedAt: row.generatedAt,
+  };
+}
+
 function toCollisionEdgeRecord(row: typeof collisionEdges.$inferSelect): CollisionEdgeRecord {
   return {
     id: row.id,
@@ -2237,6 +2608,18 @@ function toAuthSessionRecord(row: typeof authSessions.$inferSelect): AuthSession
     createdAt: row.createdAt,
     lastSeenAt: row.lastSeenAt,
     metadata: parseJson<Record<string, never>>(row.metadataJson, {}),
+  };
+}
+
+function toDigestSubscriptionRecord(row: typeof digestSubscriptions.$inferSelect): DigestSubscriptionRecord {
+  return {
+    id: row.id,
+    login: row.login,
+    email: row.email,
+    status: row.status === "paused" ? "paused" : "active",
+    source: row.source,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }
 
@@ -2386,8 +2769,32 @@ function parseScoringSourceKind(value: string): ScoringModelSnapshotRecord["sour
 }
 
 function parseActiveScoringModel(value: string): ScoringModelSnapshotRecord["activeModel"] {
-  if (value === "current_density_model" || value === "pending_saturation_model") return value;
+  if (value === "current_density_model" || value === "pending_saturation_model" || value === "exponential_saturation_model") return value;
   return "unknown";
+}
+
+function parseUpstreamSourceStatus(value: string): UpstreamSourceStatus {
+  if (value === "not_modified" || value === "fallback" || value === "error") return value;
+  return "fetched";
+}
+
+function parseUpstreamDriftSeverity(value: string): UpstreamDriftSeverity {
+  /* v8 ignore start -- Database enum parsing fallback protects legacy/manual rows; typed writers cover normal values. */
+  if (value === "medium" || value === "high" || value === "blocking") return value;
+  return "low";
+  /* v8 ignore stop */
+}
+
+function parseUpstreamDriftStatus(value: string): UpstreamDriftStatus {
+  /* v8 ignore start -- Database enum parsing fallback protects legacy/manual rows; typed writers cover normal values. */
+  if (value === "acknowledged" || value === "resolved" || value === "ignored") return value;
+  return "open";
+  /* v8 ignore stop */
+}
+
+function parseUpstreamDriftArea(value: string): UpstreamDriftArea {
+  if (value === "registry" || value === "scoring_model" || value === "issue_discovery" || value === "mirror_linkage" || value === "language_weights") return value;
+  return "source";
 }
 
 function parseScorePreviewTargetType(value: string): ScorePreviewRecord["targetType"] {

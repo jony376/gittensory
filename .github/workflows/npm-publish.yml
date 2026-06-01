@@ -6,8 +6,7 @@ on:
       - "mcp-v*.*.*"
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 concurrency:
   group: npm-publish-${{ github.ref_name }}
@@ -16,12 +15,16 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
@@ -49,7 +52,7 @@ jobs:
           set -euo pipefail
           PACK_JSON="$(npm pack --workspace @jsonbored/gittensory-mcp --json)"
           TARBALL="$(node -e 'const fs=require("fs"); const input=fs.readFileSync(0,"utf8"); process.stdout.write(JSON.parse(input)[0].filename)' <<< "$PACK_JSON")"
-          UNEXPECTED_FILES="$(tar -tzf "$TARBALL" | grep -Ev '^(package/(bin|lib)/.+|package/(package.json|README.md|CHANGELOG.md|LICENSE))$' || true)"
+          UNEXPECTED_FILES="$(tar -tzf "$TARBALL" | grep -Ev '^(package/(bin|lib|scripts)/.+|package/(package.json|README.md|CHANGELOG.md|LICENSE))$' || true)"
           if [ -n "$UNEXPECTED_FILES" ]; then
             printf '%s\n' "$UNEXPECTED_FILES"
             echo "Unexpected file in package tarball"
@@ -67,6 +70,13 @@ jobs:
       - name: Publish with npm trusted publishing
         run: npx -y npm@11.15.0 publish --workspace @jsonbored/gittensory-mcp --access public --provenance
 
+  github-release:
+    runs-on: ubuntu-latest
+    needs: publish
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

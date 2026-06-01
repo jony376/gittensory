@@ -1,6 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createSessionForGitHubUser } from "../../src/auth/security";
 import {
   upsertBounty,
+  upsertBurdenForecast,
   upsertCheckSummary,
   upsertInstallation,
   upsertInstallationHealth,
@@ -10,6 +12,9 @@ import {
   upsertRecentMergedPullRequest,
   persistRepoGithubTotalsSnapshot,
   persistSignalSnapshot,
+  recordGitHubRateLimitObservation,
+  listLatestSignalSnapshotsByTarget,
+  persistUpstreamRulesetSnapshot,
   upsertRepoLabel,
   upsertRepoSyncSegment,
   upsertRepoSyncState,
@@ -20,32 +25,68 @@ import {
   upsertRepositorySettings,
 } from "../../src/db/repositories";
 import { createApp } from "../../src/api/routes";
+import { BURDEN_FORECAST_MAX_AGE_MS } from "../../src/services/burden-forecast";
 import { normalizeRegistryPayload } from "../../src/registry/normalize";
 import { persistRegistrySnapshot } from "../../src/registry/sync";
 import { createTestEnv } from "../helpers/d1";
+import type { JsonValue } from "../../src/types";
 
 describe("api routes", () => {
+  // Freshness/readiness fixtures are dated relative to late May 2026; pin the clock so freshness SLO
+  // windows stay deterministic regardless of when CI runs (fixtures otherwise tip "stale" after 7 days).
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-28T00:00:00.000Z"));
+  });
+
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
-  it("serves health openly and keeps OpenAPI private", async () => {
+  it("serves health and OpenAPI openly", async () => {
     const app = createApp();
     const env = createTestEnv();
 
     const preflight = await app.request("/v1/repos", { method: "OPTIONS", headers: { origin: "https://gittensory.aethereal.dev" } }, env);
     expect(preflight.status).toBe(204);
+    expect(preflight.headers.get("access-control-allow-origin")).toBe("https://gittensory.aethereal.dev");
+
+    const dynamicOriginEnv = createTestEnv({ PUBLIC_SITE_ORIGIN: "https://preview.gittensory.test/app", PUBLIC_API_ORIGIN: "not a url" });
+    const dynamicPreflight = await app.request("/v1/repos", { method: "OPTIONS", headers: { origin: "https://preview.gittensory.test" } }, dynamicOriginEnv);
+    expect(dynamicPreflight.status).toBe(204);
+    expect(dynamicPreflight.headers.get("access-control-allow-origin")).toBe("https://preview.gittensory.test");
 
     const health = await app.request("/health", {}, env);
     expect(health.status).toBe(200);
-    await expect(health.json()).resolves.toMatchObject({ status: "ok", service: "gittensory-api" });
+    await expect(health.json()).resolves.toMatchObject({
+      status: "ok",
+      service: "gittensory-api",
+      minMcpVersion: "0.2.0",
+      latestRecommendedMcpVersion: "0.3.0",
+    });
+
+    const compatibility = await app.request("/v1/mcp/compatibility", {}, env);
+    expect(compatibility.status).toBe(200);
+    const compatibilityPayload = await compatibility.json();
+    expect(compatibilityPayload).toMatchObject({
+      status: "ok",
+      service: "gittensory-api",
+      apiVersion: "0.1.0",
+      mcp: {
+        packageName: "@jsonbored/gittensory-mcp",
+        minimumSupportedVersion: "0.2.0",
+        latestRecommendedVersion: "0.3.0",
+        latestPackageVersion: "0.3.0",
+      },
+      compatibilityWarnings: [],
+      breakingChanges: [],
+    });
+    expect(JSON.stringify(compatibilityPayload)).not.toMatch(/token|admin|wallet|hotkey|raw trust|scoreability|private repo|local-path/i);
 
     const unauthenticatedSpec = await app.request("/openapi.json", {}, env);
-    expect(unauthenticatedSpec.status).toBe(401);
-
-    const spec = await app.request("/openapi.json", { headers: apiHeaders(env) }, env);
-    expect(spec.status).toBe(200);
-    await expect(spec.json()).resolves.toMatchObject({ info: { title: "Gittensory API" } });
+    expect(unauthenticatedSpec.status).toBe(200);
+    await expect(unauthenticatedSpec.json()).resolves.toMatchObject({ info: { title: "Gittensory API" } });
   });
 
   it("serves registry drift through the canonical registry change endpoint", async () => {
@@ -87,6 +128,36 @@ describe("api routes", () => {
 
     const legacyPerRepoDrift = await app.request("/v1/repos/owner/changed/registry-drift", { headers: apiHeaders(env) }, env);
     expect(legacyPerRepoDrift.status).toBe(404);
+  });
+
+  it("serves upstream ruleset status, ruleset snapshots, and drift reports through private APIs", async () => {
+    const app = createApp();
+    const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
+    vi.stubGlobal("fetch", upstreamContractFetch());
+
+    const missing = await app.request("/v1/upstream/status", { headers: apiHeaders(env) }, env);
+    expect(missing.status).toBe(200);
+    await expect(missing.json()).resolves.toMatchObject({ status: "unavailable" });
+
+    const refresh = await app.request(
+      "/v1/internal/jobs/refresh-upstream-drift/run",
+      { method: "POST", headers: { authorization: `Bearer ${env.INTERNAL_JOB_TOKEN}` } },
+      env,
+    );
+    expect(refresh.status).toBe(200);
+    await expect(refresh.json()).resolves.toMatchObject({ ruleset: { activeModel: "pending_saturation_model", registryRepoCount: 1 }, drift: null });
+
+    const status = await app.request("/v1/upstream/status", { headers: apiHeaders(env) }, env);
+    expect(status.status).toBe(200);
+    await expect(status.json()).resolves.toMatchObject({ status: "current", activeModel: "pending_saturation_model" });
+
+    const ruleset = await app.request("/v1/upstream/ruleset", { headers: apiHeaders(env) }, env);
+    expect(ruleset.status).toBe(200);
+    await expect(ruleset.json()).resolves.toMatchObject({ commitSha: "api-commit", registryRepoCount: 1 });
+
+    const drift = await app.request("/v1/upstream/drift", { headers: apiHeaders(env) }, env);
+    expect(drift.status).toBe(200);
+    await expect(drift.json()).resolves.toMatchObject({ upstreamDrift: { status: "current" }, reports: [] });
   });
 
   it("queues signed GitHub webhooks and rejects invalid signatures", async () => {
@@ -412,6 +483,12 @@ describe("api routes", () => {
     expect(fetchedAgentRun.status).toBe(200);
     await expect(fetchedAgentRun.json()).resolves.toMatchObject({ run: { id: agentPlanPayload.run.id }, actions: expect.any(Array) });
 
+    const listedAgentRuns = await app.request("/v1/agent/runs?actorLogin=oktofeesh1", { headers: apiHeaders(env) }, env);
+    expect(listedAgentRuns.status).toBe(200);
+    await expect(listedAgentRuns.json()).resolves.toMatchObject({
+      runs: expect.arrayContaining([expect.objectContaining({ run: expect.objectContaining({ id: agentPlanPayload.run.id }) })]),
+    });
+
     const missingRepoDecisionSnapshot = await app.request("/v1/contributors/new-user/repos/entrius/allways-ui/decision", { headers: apiHeaders(env) }, env);
     expect(missingRepoDecisionSnapshot.status).toBe(202);
     await expect(missingRepoDecisionSnapshot.json()).resolves.toMatchObject({
@@ -577,6 +654,22 @@ describe("api routes", () => {
     );
     expect(localBranchWithLocalTarget.status).toBe(200);
 
+    const oversizedLocalBranch = await app.request(
+      "/v1/local/branch-analysis",
+      {
+        method: "POST",
+        headers: apiHeaders(env),
+        body: JSON.stringify({
+          login: "oktofeesh1",
+          repoFullName: "entrius/allways-ui",
+          branchName: "a".repeat(257),
+          changedFiles: [{ path: "src/cache.ts", additions: 1, deletions: 0 }],
+        }),
+      },
+      env,
+    );
+    expect(oversizedLocalBranch.status).toBe(400);
+
     const sourceContentRejected = await app.request(
       "/v1/local/branch-analysis",
       {
@@ -615,7 +708,8 @@ describe("api routes", () => {
       env,
     );
     expect(imported.status).toBe(200);
-    await expect(imported.json()).resolves.toMatchObject({ imported: 1 });
+    // A first sighting of bounty id "2" records one lifecycle event (the watcher).
+    await expect(imported.json()).resolves.toMatchObject({ imported: 1, lifecycleEvents: 1 });
 
     const bounties = await app.request("/v1/bounties", { headers: apiHeaders(env) }, env);
     expect(bounties.status).toBe(200);
@@ -623,7 +717,33 @@ describe("api routes", () => {
 
     const bountyAdvisory = await app.request("/v1/bounties/bounty-1/advisory", { headers: apiHeaders(env) }, env);
     expect(bountyAdvisory.status).toBe(200);
-    await expect(bountyAdvisory.json()).resolves.toMatchObject({ lifecycle: "historical", fundingStatus: "target_only" });
+    await expect(bountyAdvisory.json()).resolves.toMatchObject({ lifecycle: "completed", isActiveOpportunity: false, fundingStatus: "target_only" });
+
+    // Re-importing the same bounty with a changed status records a second lifecycle transition; an unchanged re-import records none.
+    const reimported = await app.request(
+      "/v1/internal/bounties/import",
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${env.INTERNAL_JOB_TOKEN}` },
+        body: JSON.stringify({
+          success: true,
+          issue_count: 1,
+          issues: [{ id: 2, repository_full_name: "entrius/allways-ui", issue_number: 8, status: "Completed", bounty_alpha: "0.0000", target_alpha: "17.0000" }],
+        }),
+      },
+      env,
+    );
+    await expect(reimported.json()).resolves.toMatchObject({ imported: 1, lifecycleEvents: 1 });
+
+    const lifecycle = await app.request("/v1/bounties/2/lifecycle", { headers: apiHeaders(env) }, env);
+    expect(lifecycle.status).toBe(200);
+    const lifecycleBody = (await lifecycle.json()) as { bountyId: string; events: Array<{ status: string }> };
+    expect(lifecycleBody.bountyId).toBe("2");
+    expect(lifecycleBody.events).toHaveLength(2);
+    expect(lifecycleBody.events.map((event) => event.status)).toEqual(expect.arrayContaining(["Cancelled", "Completed"]));
+
+    const missingLifecycle = await app.request("/v1/bounties/missing/lifecycle", { headers: apiHeaders(env) }, env);
+    expect(missingLifecycle.status).toBe(404);
 
     const missingBountyAdvisory = await app.request("/v1/bounties/missing/advisory", { headers: apiHeaders(env) }, env);
     expect(missingBountyAdvisory.status).toBe(404);
@@ -710,6 +830,16 @@ describe("api routes", () => {
       ["maintainer-lane", { repoFullName: "entrius/allways-ui" }],
       ["maintainer-cut-readiness", { repoFullName: "entrius/allways-ui" }],
       ["contributor-intake-health", { repoFullName: "entrius/allways-ui" }],
+      [
+        "issue-quality",
+        {
+          repoFullName: "entrius/allways-ui",
+          generatedAt: "2026-05-25T00:00:00.000Z",
+          lane: { lane: "direct_pr" },
+          issues: [{ number: 7, title: "fixture", status: "ready", score: 80, reasons: [], warnings: [] }],
+          summary: "fixture",
+        },
+      ],
     ] as const) {
       await persistSignalSnapshot(env, {
         id: `snapshot-${signalType}`,
@@ -720,12 +850,53 @@ describe("api routes", () => {
         generatedAt: "2026-05-25T00:00:00.000Z",
       });
     }
+    const staleForecastGeneratedAt = new Date(Date.now() - BURDEN_FORECAST_MAX_AGE_MS - 60_000).toISOString();
+    await upsertBurdenForecast(env, {
+      repoFullName: "entrius/allways-ui",
+      payload: { repoFullName: "entrius/allways-ui", level: "medium", summary: "intelligence fixture" } as unknown as Record<string, JsonValue>,
+      generatedAt: staleForecastGeneratedAt,
+    });
     const snapshotIntelligence = await app.request("/v1/repos/entrius/allways-ui/intelligence", { headers: apiHeaders(env) }, env);
     expect(snapshotIntelligence.status).toBe(200);
-    await expect(snapshotIntelligence.json()).resolves.toMatchObject({ source: "snapshot", queueHealth: { signals: { openPullRequests: 2 } } });
+    const snapshotIntelligenceBody = (await snapshotIntelligence.json()) as Record<string, unknown> & { burdenForecast?: Record<string, unknown>; burdenForecastFreshness?: { freshness: string; source: string; ageSeconds: number } };
+    expect(snapshotIntelligenceBody).toMatchObject({ source: "snapshot", queueHealth: { signals: { openPullRequests: 2 } } });
+    expect(snapshotIntelligenceBody.burdenForecast).toMatchObject({ level: "medium" });
+    expect(snapshotIntelligenceBody.burdenForecastFreshness).toMatchObject({ source: "snapshot", freshness: "stale" });
+    expect(snapshotIntelligenceBody.burdenForecastFreshness?.ageSeconds).toBeGreaterThanOrEqual(Math.floor((BURDEN_FORECAST_MAX_AGE_MS + 50_000) / 1000));
+    expect(snapshotIntelligenceBody.burdenForecastFreshness?.ageSeconds).toBeLessThan(Math.floor((BURDEN_FORECAST_MAX_AGE_MS + 120_000) / 1000));
+
+    await upsertRepositoryFromGitHub(env, { name: "uncached-burden", full_name: "entrius/uncached-burden", private: false, owner: { login: "entrius" }, default_branch: "main" });
+    const computedIntelligence = await app.request("/v1/repos/entrius/uncached-burden/intelligence", { headers: apiHeaders(env) }, env);
+    expect(computedIntelligence.status).toBe(200);
+    await expect(computedIntelligence.json()).resolves.toMatchObject({
+      source: "computed",
+      burdenForecast: { repoFullName: "entrius/uncached-burden", level: "low" },
+      burdenForecastFreshness: { source: "computed", freshness: "fresh", ageSeconds: 0 },
+    });
+
+    const degradedForecastEnv = withBurdenForecastReadFailure(env);
+    const degradedIntelligence = await app.request("/v1/repos/entrius/allways-ui/intelligence", { headers: apiHeaders(env) }, degradedForecastEnv);
+    expect(degradedIntelligence.status).toBe(200);
+    const degradedBody = (await degradedIntelligence.json()) as Record<string, unknown> & { dataQuality: { status: string; warnings: string[] }; burdenForecast?: unknown };
+    expect(degradedBody.burdenForecast).toBeUndefined();
+    expect(degradedBody.dataQuality.status).toBe("degraded");
+    expect(degradedBody.dataQuality.warnings).toEqual(expect.arrayContaining([expect.stringMatching(/Burden forecast unavailable/i)]));
+
+    const issueQuality = await app.request("/v1/repos/entrius/allways-ui/issue-quality", { headers: apiHeaders(env) }, env);
+    expect(issueQuality.status).toBe(200);
+    await expect(issueQuality.json()).resolves.toMatchObject({
+      status: "ready",
+      source: "snapshot",
+      repoFullName: "entrius/allways-ui",
+      report: { repoFullName: "entrius/allways-ui", issues: expect.any(Array) },
+    });
+
+    await upsertRepositoryFromGitHub(env, { name: "uncached", full_name: "entrius/uncached", private: false, owner: { login: "entrius" }, default_branch: "main" });
+    const computedIssueQuality = await app.request("/v1/repos/entrius/uncached/issue-quality", { headers: apiHeaders(env) }, env);
+    expect(computedIssueQuality.status).toBe(200);
+    await expect(computedIssueQuality.json()).resolves.toMatchObject({ status: "ready", source: "computed", repoFullName: "entrius/uncached" });
 
     for (const path of [
-      "/v1/repos/entrius/allways-ui/issue-quality",
       "/v1/repos/entrius/allways-ui/burden-forecast",
       "/v1/repos/entrius/allways-ui/pulls/12/scoring-preview",
       "/v1/contributors/oktofeesh1/scoring-profile",
@@ -736,6 +907,503 @@ describe("api routes", () => {
       const legacy = await app.request(path, { headers: apiHeaders(env) }, env);
       expect(legacy.status).toBe(404);
     }
+  });
+
+  it("serves live app dashboards, digest subscriptions, commands, and extension context", async () => {
+    const app = createApp();
+    const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "oktofeesh1,other" });
+    await seedSignalData(env);
+    stubOktofeeshFetch();
+
+    const { token: browserToken } = await createSessionForGitHubUser(env, { login: "oktofeesh1", id: 12345 });
+    const cookieHeaders = { cookie: `gittensory_session=${browserToken}`, "content-type": "application/json" };
+
+    const overviewPreflight = await app.request("/v1/app/overview", { method: "OPTIONS", headers: { origin: "https://gittensory.aethereal.dev" } }, env);
+    expect(overviewPreflight.status).toBe(204);
+    const bareOverviewPreflight = await app.request("/v1/app/overview", { method: "OPTIONS" }, env);
+    expect(bareOverviewPreflight.status).toBe(204);
+
+    const overview = await app.request("/v1/app/overview", { headers: cookieHeaders }, env);
+    expect(overview.status).toBe(200);
+    await expect(overview.json()).resolves.toMatchObject({
+      actor: { kind: "session", login: "oktofeesh1" },
+      metrics: expect.arrayContaining([expect.objectContaining({ label: "Registered repos" })]),
+      upstreamDrift: expect.any(Object),
+    });
+
+    const emptyEnv = createTestEnv();
+    const emptyOverview = await app.request("/v1/app/overview", { headers: apiHeaders(emptyEnv) }, emptyEnv);
+    expect(emptyOverview.status).toBe(200);
+    await expect(emptyOverview.json()).resolves.toMatchObject({
+      actor: { kind: "static", login: "api" },
+      registry: null,
+      scoringModel: null,
+      recentRuns: [],
+    });
+
+    const missingRuleset = await app.request("/v1/upstream/ruleset", { headers: apiHeaders(emptyEnv) }, emptyEnv);
+    expect(missingRuleset.status).toBe(404);
+    const emptySyncStatus = await app.request("/v1/sync/status", { headers: apiHeaders(emptyEnv) }, emptyEnv);
+    expect(emptySyncStatus.status).toBe(200);
+    await expect(emptySyncStatus.json()).resolves.toMatchObject({ repositories: [], segments: [] });
+    const emptyOperator = await app.request("/v1/app/operator-dashboard", { headers: apiHeaders(emptyEnv) }, emptyEnv);
+    expect(emptyOperator.status).toBe(200);
+    await expect(emptyOperator.json()).resolves.toMatchObject({
+      metrics: expect.arrayContaining([expect.objectContaining({ label: "Registered repos", delta: "registry missing" })]),
+    });
+    const driftDigest = await app.request("/v1/app/digest", { headers: apiHeaders(emptyEnv) }, emptyEnv);
+    expect(driftDigest.status).toBe(200);
+    await expect(driftDigest.json()).resolves.toMatchObject({
+      signal: "warn",
+      items: expect.arrayContaining([expect.objectContaining({ kind: "drift", meta: "watch" })]),
+    });
+
+    const missingMinerLogin = await app.request("/v1/app/miner-dashboard", { headers: apiHeaders(env) }, env);
+    expect(missingMinerLogin.status).toBe(400);
+
+    const { token: otherToken } = await createSessionForGitHubUser(env, { login: "other", id: 987 });
+    const forbiddenMiner = await app.request("/v1/app/miner-dashboard?login=oktofeesh1", { headers: { cookie: `gittensory_session=${otherToken}` } }, env);
+    expect(forbiddenMiner.status).toBe(403);
+
+    const minerNeedsRefresh = await app.request("/v1/app/miner-dashboard?login=oktofeesh1", { headers: apiHeaders(env) }, env);
+    expect(minerNeedsRefresh.status).toBe(200);
+    await expect(minerNeedsRefresh.json()).resolves.toMatchObject({
+      status: "needs_refresh",
+      blockers: [expect.objectContaining({ group: "decision-pack" })],
+    });
+
+    const builtDecisionPack = await app.request(
+      "/v1/internal/jobs/build-contributor-decision-packs/run",
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${env.INTERNAL_JOB_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ login: "oktofeesh1" }),
+      },
+      env,
+    );
+    expect(builtDecisionPack.status).toBe(200);
+
+    const minerReady = await app.request("/v1/app/miner-dashboard", { headers: cookieHeaders }, env);
+    expect(minerReady.status).toBe(200);
+    await expect(minerReady.json()).resolves.toMatchObject({
+      status: "ready",
+      login: "oktofeesh1",
+      nextActions: expect.any(Array),
+      projections: expect.any(Array),
+      repoFit: expect.any(Array),
+      mcp: expect.objectContaining({ snapshot: "scoring-1" }),
+    });
+
+    await persistSignalSnapshot(env, {
+      id: "blocker-pack",
+      signalType: "contributor-decision-pack",
+      targetKey: "blocker-user",
+      payload: {
+        status: "ready",
+        source: "computed",
+        login: "blocker-user",
+        generatedAt: new Date().toISOString(),
+        stale: false,
+        freshness: "fresh",
+        rebuildEnqueued: false,
+        scoringModelSnapshotId: "scoring-1",
+        repoDecisions: [{ recommendation: "fallback" }, { priorityScore: 250 }, {}],
+        topActions: undefined,
+        cleanupFirst: undefined,
+        pursueRepos: undefined,
+        avoidRepos: undefined,
+        maintainerLaneRepos: undefined,
+        scoreBlockers: ["legacy blocker", { code: "open_pr_pressure", detail: "Too many open PRs" }],
+        dataQuality: { signalFidelity: { status: "degraded" } },
+      } as never,
+      generatedAt: new Date().toISOString(),
+    });
+    const minerWithBlockers = await app.request("/v1/app/miner-dashboard?login=blocker-user", { headers: apiHeaders(env) }, env);
+    expect(minerWithBlockers.status).toBe(200);
+    await expect(minerWithBlockers.json()).resolves.toMatchObject({
+      status: "ready",
+      blockers: expect.arrayContaining([expect.objectContaining({ group: "scoreability" })]),
+      projections: expect.arrayContaining([expect.objectContaining({ name: "fallback" }), expect.objectContaining({ name: "repo" })]),
+      repoFit: [],
+    });
+
+    await recordGitHubRateLimitObservation(env, {
+      id: "rate-limit-healthy",
+      repoFullName: "entrius/allways-ui",
+      resource: "graphql",
+      path: "/graphql",
+      statusCode: 200,
+      limitValue: 5000,
+      remaining: 10,
+      resetAt: "2026-05-31T12:00:00.000Z",
+      observedAt: "2026-05-31T10:00:00.000Z",
+    });
+    await upsertPullRequestFromGitHub(env, "entrius/allways-ui", {
+      number: 14,
+      title: "Document install recovery",
+      state: "open",
+      html_url: "https://github.com/entrius/allways-ui/pull/14",
+      labels: [],
+      body: "No linked issue here.",
+    });
+    const maintainer = await app.request("/v1/app/maintainer-dashboard", { headers: apiHeaders(env) }, env);
+    expect(maintainer.status).toBe(200);
+    await expect(maintainer.json()).resolves.toMatchObject({
+      installations: expect.any(Array),
+      health: expect.arrayContaining([expect.objectContaining({ status: "healthy" })]),
+      reviewability: expect.arrayContaining([
+        expect.objectContaining({ pr: "entrius/allways-ui#12" }),
+        expect.objectContaining({ pr: "entrius/allways-ui#14", author: "unknown", reason: "cached open PR without linked issue" }),
+      ]),
+      settingsPreview: { added: expect.any(Array), removed: expect.any(Array) },
+    });
+
+    const operator = await app.request("/v1/app/operator-dashboard", { headers: apiHeaders(env) }, env);
+    expect(operator.status).toBe(200);
+    await expect(operator.json()).resolves.toMatchObject({
+      metrics: expect.arrayContaining([expect.objectContaining({ label: "Active sessions" }), expect.objectContaining({ label: "Digest subscriptions" })]),
+      noiseReduction: expect.any(Array),
+      weeklyReport: expect.arrayContaining([expect.stringContaining("registered repos")]),
+    });
+
+    const commands = await app.request("/v1/app/commands", { headers: apiHeaders(env) }, env);
+    expect(commands.status).toBe(200);
+    await expect(commands.json()).resolves.toMatchObject({
+      commands: expect.arrayContaining([expect.objectContaining({ id: "public-summary" })]),
+    });
+
+    const publicPreview = await app.request(
+      "/v1/app/commands/preview",
+      {
+        method: "POST",
+        headers: apiHeaders(env),
+        body: JSON.stringify({ command: "@gittensory public-summary", repoFullName: "entrius/allways-ui", pullNumber: 12 }),
+      },
+      env,
+    );
+    expect(publicPreview.status).toBe(200);
+    await expect(publicPreview.json()).resolves.toMatchObject({
+      preview: { boundary: "public", body: expect.stringContaining("entrius/allways-ui#12") },
+    });
+
+    const privatePreview = await app.request(
+      "/v1/app/commands/preview",
+      {
+        method: "POST",
+        headers: apiHeaders(env),
+        body: JSON.stringify({ command: "preflight", repoFullName: "entrius/allways-ui", login: "oktofeesh1" }),
+      },
+      env,
+    );
+    expect(privatePreview.status).toBe(200);
+    await expect(privatePreview.json()).resolves.toMatchObject({
+      preview: { boundary: "private-api", endpoint: "/v1/agent/preflight-branch" },
+    });
+
+    const privatePreviewWithoutTarget = await app.request(
+      "/v1/app/commands/preview",
+      {
+        method: "POST",
+        headers: apiHeaders(env),
+        body: JSON.stringify({ command: "preflight" }),
+      },
+      env,
+    );
+    expect(privatePreviewWithoutTarget.status).toBe(200);
+    await expect(privatePreviewWithoutTarget.json()).resolves.toMatchObject({
+      preview: { body: expect.stringContaining("selected target") },
+    });
+
+    expect((await app.request("/v1/app/commands/preview", { method: "POST", headers: apiHeaders(env), body: "{}" }, env)).status).toBe(400);
+    expect((await app.request("/v1/app/commands/preview", { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ command: "unknown" }) }, env)).status).toBe(404);
+
+    const digest = await app.request("/v1/app/digest", { headers: cookieHeaders }, env);
+    expect(digest.status).toBe(200);
+    await expect(digest.json()).resolves.toMatchObject({
+      delivery: { mode: "store_only", emailDeliveryEnabled: false },
+      items: expect.arrayContaining([expect.objectContaining({ kind: "summary" })]),
+      subscriptions: [],
+    });
+
+    const staticDigest = await app.request("/v1/app/digest", { headers: apiHeaders(env) }, env);
+    expect(staticDigest.status).toBe(200);
+    await expect(staticDigest.json()).resolves.toMatchObject({ signal: "ready", subscriptions: [] });
+
+    const staticDigestSubscription = await app.request(
+      "/v1/app/digest/subscriptions",
+      { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ email: "operator@example.com" }) },
+      env,
+    );
+    expect(staticDigestSubscription.status).toBe(403);
+
+    const invalidDigestSubscription = await app.request(
+      "/v1/app/digest/subscriptions",
+      { method: "POST", headers: cookieHeaders, body: JSON.stringify({ email: "not-an-email" }) },
+      env,
+    );
+    expect(invalidDigestSubscription.status).toBe(400);
+
+    const storedDigestSubscription = await app.request(
+      "/v1/app/digest/subscriptions",
+      { method: "POST", headers: cookieHeaders, body: JSON.stringify({ email: "operator@example.com" }) },
+      env,
+    );
+    expect(storedDigestSubscription.status).toBe(201);
+    await expect(storedDigestSubscription.json()).resolves.toMatchObject({
+      status: "stored",
+      subscription: { login: "oktofeesh1", email: "operator@example.com" },
+      delivery: { mode: "store_only", emailDeliveryEnabled: false },
+    });
+
+    const digestWithSubscription = await app.request("/v1/app/digest", { headers: cookieHeaders }, env);
+    expect(digestWithSubscription.status).toBe(200);
+    await expect(digestWithSubscription.json()).resolves.toMatchObject({
+      subscriptions: expect.arrayContaining([expect.objectContaining({ email: "operator@example.com" })]),
+    });
+
+    await recordGitHubRateLimitObservation(env, {
+      id: "rate-limit-rest",
+      repoFullName: "entrius/allways-ui",
+      resource: "rest",
+      path: "/repos/entrius/allways-ui/pulls",
+      statusCode: 403,
+      limitValue: 5000,
+      remaining: 0,
+      resetAt: "2026-05-31T12:00:00.000Z",
+      observedAt: "2026-05-31T11:00:00.000Z",
+    });
+    await upsertInstallationHealth(env, {
+      installationId: 123,
+      accountLogin: "entrius",
+      repositorySelection: "selected",
+      installedReposCount: 1,
+      registeredInstalledCount: 1,
+      status: "needs_attention",
+      missingPermissions: ["checks"],
+      missingEvents: ["pull_request_review"],
+      permissions: { metadata: "read", pull_requests: "read", issues: "write" },
+      events: ["issues", "pull_request", "repository"],
+      checkedAt: "2026-05-31T11:00:00.000Z",
+    });
+    await upsertInstallationHealth(env, {
+      installationId: 456,
+      accountLogin: "jsonbored",
+      repositorySelection: "selected",
+      installedReposCount: 1,
+      registeredInstalledCount: 0,
+      status: "needs_attention",
+      missingPermissions: [],
+      missingEvents: [],
+      permissions: { metadata: "read" },
+      events: [],
+      checkedAt: "2026-05-31T11:01:00.000Z",
+    });
+    const warningDigest = await app.request("/v1/app/digest", { headers: cookieHeaders }, env);
+    expect(warningDigest.status).toBe(200);
+    await expect(warningDigest.json()).resolves.toMatchObject({
+      signal: "warn",
+      items: expect.arrayContaining([expect.objectContaining({ kind: "install" }), expect.objectContaining({ kind: "queue" })]),
+    });
+    const overviewWithWarnings = await app.request("/v1/app/overview", { headers: cookieHeaders }, env);
+    expect(overviewWithWarnings.status).toBe(200);
+    await expect(overviewWithWarnings.json()).resolves.toMatchObject({
+      metrics: expect.arrayContaining([expect.objectContaining({ label: "Install issues", delta: "needs attention" })]),
+      rateLimits: expect.arrayContaining([expect.objectContaining({ id: "rate-limit-rest" })]),
+    });
+
+    const forbiddenRuns = await app.request("/v1/agent/runs?actorLogin=oktofeesh1", { headers: { cookie: `gittensory_session=${otherToken}` } }, env);
+    expect(forbiddenRuns.status).toBe(403);
+    const invalidLimitRuns = await app.request("/v1/agent/runs?actorLogin=oktofeesh1&limit=not-a-number", { headers: cookieHeaders }, env);
+    expect(invalidLimitRuns.status).toBe(200);
+
+    const staticExtensionSession = await app.request("/v1/auth/extension/session", { method: "POST", headers: apiHeaders(env) }, env);
+    expect(staticExtensionSession.status).toBe(403);
+
+    const extensionSession = await app.request("/v1/auth/extension/session", { method: "POST", headers: cookieHeaders }, env);
+    expect(extensionSession.status).toBe(201);
+    const extensionSessionBody = (await extensionSession.json()) as { token: string; login: string; scopes: string[] };
+    expect(extensionSessionBody).toMatchObject({ login: "oktofeesh1", scopes: ["extension:pull_context"] });
+
+    const remintedExtensionSession = await app.request(
+      "/v1/auth/extension/session",
+      { method: "POST", headers: { authorization: `Bearer ${extensionSessionBody.token}` } },
+      env,
+    );
+    expect(remintedExtensionSession.status).toBe(403);
+
+    const extensionDecisionPack = await app.request(
+      "/v1/contributors/oktofeesh1/decision-pack",
+      { headers: { authorization: `Bearer ${extensionSessionBody.token}` } },
+      env,
+    );
+    expect(extensionDecisionPack.status).toBe(403);
+    await expect(extensionDecisionPack.json()).resolves.toMatchObject({ error: "insufficient_scope" });
+
+    const extensionOverview = await app.request("/v1/app/overview", { headers: { authorization: `Bearer ${extensionSessionBody.token}` } }, env);
+    expect(extensionOverview.status).toBe(403);
+    await expect(extensionOverview.json()).resolves.toMatchObject({ error: "insufficient_scope" });
+
+    const fallbackOriginEnv = createTestEnv({ ADMIN_GITHUB_LOGINS: "oktofeesh1" });
+    delete (fallbackOriginEnv as Partial<Env>).PUBLIC_API_ORIGIN;
+    const { token: noIdToken } = await createSessionForGitHubUser(fallbackOriginEnv, { login: "oktofeesh1" });
+    const fallbackOriginExtensionSession = await app.request(
+      "/v1/auth/extension/session",
+      { method: "POST", headers: { cookie: `gittensory_session=${noIdToken}` } },
+      fallbackOriginEnv,
+    );
+    expect(fallbackOriginExtensionSession.status).toBe(201);
+    await expect(fallbackOriginExtensionSession.json()).resolves.toMatchObject({ apiOrigin: "http://localhost" });
+
+    const invalidExtensionContext = await app.request("/v1/extension/pull-context?owner=entrius&repo=allways-ui", { headers: { authorization: `Bearer ${extensionSessionBody.token}` } }, env);
+    expect(invalidExtensionContext.status).toBe(400);
+    const invalidZeroExtensionContext = await app.request("/v1/extension/pull-context?owner=entrius&repo=allways-ui&pullNumber=0", { headers: { authorization: `Bearer ${extensionSessionBody.token}` } }, env);
+    expect(invalidZeroExtensionContext.status).toBe(400);
+    const invalidMissingOwnerExtensionContext = await app.request("/v1/extension/pull-context?repo=allways-ui&pullNumber=12", { headers: { authorization: `Bearer ${extensionSessionBody.token}` } }, env);
+    expect(invalidMissingOwnerExtensionContext.status).toBe(400);
+
+    const extensionContext = await app.request(
+      "/v1/extension/pull-context?owner=entrius&repo=allways-ui&pullNumber=12",
+      { headers: { authorization: `Bearer ${extensionSessionBody.token}` } },
+      env,
+    );
+    expect(extensionContext.status).toBe(200);
+    await expect(extensionContext.json()).resolves.toMatchObject({
+      repoFullName: "entrius/allways-ui",
+      pullNumber: 12,
+      reviewability: { repoFullName: "entrius/allways-ui", pullNumber: 12 },
+      panels: expect.arrayContaining([expect.objectContaining({ label: "Reviewability" }), expect.objectContaining({ label: "Boundary" })]),
+    });
+
+    const missingPullContext = await app.request(
+      "/v1/extension/pull-context?owner=entrius&repo=allways-ui&pullNumber=99",
+      { headers: { authorization: `Bearer ${extensionSessionBody.token}` } },
+      env,
+    );
+    expect(missingPullContext.status).toBe(200);
+    await expect(missingPullContext.json()).resolves.toMatchObject({
+      repoFullName: "entrius/allways-ui",
+      pullNumber: 99,
+      panels: expect.arrayContaining([expect.objectContaining({ label: "Contributor", badge: "unknown" })]),
+    });
+  });
+
+  it("covers live app auth, validation, and internal job queue edge routes", async () => {
+    const app = createApp();
+    const sent: Array<{ message: unknown; options?: unknown }> = [];
+    const env = createTestEnv({
+      JOBS: {
+        async send(message: unknown, options?: unknown) {
+          sent.push({ message, options });
+        },
+      } as unknown as Queue,
+    });
+    const internalHeaders = { authorization: `Bearer ${env.INTERNAL_JOB_TOKEN}`, "content-type": "application/json" };
+
+    const oauthNotConfigured = await app.request("/v1/auth/github/start", {}, env);
+    expect(oauthNotConfigured.status).toBe(503);
+    await expect(oauthNotConfigured.json()).resolves.toMatchObject({ error: "github_oauth_not_configured" });
+
+    const oauthDenied = await app.request("/v1/auth/github/callback?error=access_denied", {}, env);
+    expect(oauthDenied.status).toBe(302);
+    expect(oauthDenied.headers.get("location")).toContain("reason=access_denied");
+    expect(oauthDenied.headers.get("set-cookie")).toContain("gittensory_oauth_state=");
+    const oauthMissingCode = await app.request("/v1/auth/github/callback?state=state-only", {}, env);
+    expect(oauthMissingCode.status).toBe(302);
+    expect(oauthMissingCode.headers.get("location")).toContain("github_oauth_callback_invalid");
+
+    const invalidDevicePoll = await app.request("/v1/auth/github/device/poll", { method: "POST", body: "{" }, env);
+    expect(invalidDevicePoll.status).toBe(400);
+    const invalidGitHubSession = await app.request("/v1/auth/github/session", { method: "POST", body: "{" }, env);
+    expect(invalidGitHubSession.status).toBe(400);
+
+    const { token: noIdToken } = await createSessionForGitHubUser(env, { login: "jsonbored" });
+    const noIdSession = await app.request("/v1/auth/session", { headers: { cookie: `gittensory_session=${noIdToken}` } }, env);
+    expect(noIdSession.status).toBe(200);
+    await expect(noIdSession.json()).resolves.toMatchObject({
+      status: "authenticated",
+      login: "jsonbored",
+      githubId: null,
+      github_id: null,
+      roles: ["miner", "maintainer", "owner", "operator"],
+    });
+
+    for (const [path, error] of [
+      ["/v1/scoring/preview", "invalid_scoring_preview_request"],
+      ["/v1/agent/runs", "invalid_agent_run_request"],
+      ["/v1/agent/plan-next-work", "invalid_agent_plan_request"],
+      ["/v1/agent/preflight-branch", "invalid_agent_preflight_branch_request"],
+      ["/v1/agent/prepare-pr-packet", "invalid_agent_prepare_pr_packet_request"],
+      ["/v1/agent/explain-blockers", "invalid_agent_explain_blockers_request"],
+    ] as const) {
+      const response = await app.request(path, { method: "POST", headers: apiHeaders(env), body: "{" }, env);
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ error });
+    }
+
+    const invalidCommandPreview = await app.request("/v1/app/commands/preview", { method: "POST", headers: apiHeaders(env), body: "{" }, env);
+    expect(invalidCommandPreview.status).toBe(400);
+
+    const invalidDigestJson = await app.request("/v1/app/digest/subscriptions", { method: "POST", headers: { cookie: `gittensory_session=${noIdToken}` }, body: "{" }, env);
+    expect(invalidDigestJson.status).toBe(400);
+
+    const queuedBackfillAll = await app.request("/v1/internal/jobs/backfill-registered-repos", { method: "POST", headers: internalHeaders, body: "{" }, env);
+    expect(queuedBackfillAll.status).toBe(202);
+    await expect(queuedBackfillAll.json()).resolves.toMatchObject({ ok: true, status: "queued", force: false, mode: "light" });
+
+    const queuedBackfillResume = await app.request(
+      "/v1/internal/jobs/backfill-registered-repos",
+      { method: "POST", headers: internalHeaders, body: JSON.stringify({ repoFullName: "owner/repo", force: true, mode: "resume" }) },
+      env,
+    );
+    expect(queuedBackfillResume.status).toBe(202);
+    await expect(queuedBackfillResume.json()).resolves.toMatchObject({ repoFullName: "owner/repo", force: true, mode: "resume" });
+
+    expect((await app.request("/v1/internal/jobs/backfill-repo-segment", { method: "POST", headers: internalHeaders, body: "{}" }, env)).status).toBe(400);
+    expect((await app.request("/v1/internal/jobs/backfill-repo-segment", { method: "POST", headers: internalHeaders, body: JSON.stringify({ repoFullName: "owner/repo", segment: "metadata" }) }, env)).status).toBe(400);
+    const queuedSegment = await app.request(
+      "/v1/internal/jobs/backfill-repo-segment",
+      { method: "POST", headers: internalHeaders, body: JSON.stringify({ repoFullName: "owner/repo", segment: "labels", mode: "resume", force: true, cursor: "page-2" }) },
+      env,
+    );
+    expect(queuedSegment.status).toBe(202);
+    await expect(queuedSegment.json()).resolves.toMatchObject({ repoFullName: "owner/repo", segment: "labels", mode: "resume" });
+    expect(sent).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          message: expect.objectContaining({ type: "backfill-repo-segment", repoFullName: "owner/repo", segment: "labels", cursor: "page-2", force: true }),
+        }),
+      ]),
+    );
+
+    expect((await app.request("/v1/internal/jobs/backfill-repo-segment/run", { method: "POST", headers: internalHeaders, body: "{}" }, env)).status).toBe(400);
+    expect((await app.request("/v1/internal/jobs/backfill-repo-segment/run", { method: "POST", headers: internalHeaders, body: JSON.stringify({ repoFullName: "owner/repo", segment: "metadata" }) }, env)).status).toBe(400);
+
+    expect((await app.request("/v1/internal/jobs/backfill-pr-details", { method: "POST", headers: internalHeaders, body: "{}" }, env)).status).toBe(400);
+    const queuedPrDetails = await app.request(
+      "/v1/internal/jobs/backfill-pr-details",
+      { method: "POST", headers: internalHeaders, body: JSON.stringify({ repoFullName: "owner/repo", mode: "resume", cursor: "5" }) },
+      env,
+    );
+    expect(queuedPrDetails.status).toBe(202);
+    expect(sent).toEqual(expect.arrayContaining([expect.objectContaining({ message: expect.objectContaining({ type: "backfill-pr-details", cursor: 5 }) })]));
+    expect((await app.request("/v1/internal/jobs/backfill-pr-details/run", { method: "POST", headers: internalHeaders, body: "{}" }, env)).status).toBe(400);
+
+    expect((await app.request("/v1/internal/jobs/build-contributor-decision-packs/run", { method: "POST", headers: internalHeaders, body: "{}" }, env)).status).toBe(400);
+    expect((await app.request("/v1/internal/jobs/refresh-contributor-activity", { method: "POST", headers: internalHeaders, body: "{}" }, env)).status).toBe(400);
+    const queuedContributorRefresh = await app.request(
+      "/v1/internal/jobs/refresh-contributor-activity",
+      { method: "POST", headers: internalHeaders, body: JSON.stringify({ login: "jsonbored", repoFullName: "owner/repo" }) },
+      env,
+    );
+    expect(queuedContributorRefresh.status).toBe(202);
+    await expect(queuedContributorRefresh.json()).resolves.toMatchObject({ login: "jsonbored", repoFullName: "owner/repo" });
+    expect((await app.request("/v1/internal/jobs/refresh-contributor-activity/run", { method: "POST", headers: internalHeaders, body: "{}" }, env)).status).toBe(400);
+
+    const queuedBurden = await app.request("/v1/internal/jobs/build-burden-forecasts", { method: "POST", headers: internalHeaders, body: JSON.stringify({ repoFullName: "owner/repo" }) }, env);
+    expect(queuedBurden.status).toBe(202);
+    const queuedSignals = await app.request("/v1/internal/jobs/generate-signal-snapshots", { method: "POST", headers: internalHeaders, body: JSON.stringify({ repoFullName: "owner/repo" }) }, env);
+    expect(queuedSignals.status).toBe(202);
+    expect((await app.request("/v1/internal/repos/owner/repo/settings", { method: "POST", headers: internalHeaders, body: JSON.stringify({ commentMode: "bad" }) }, env)).status).toBe(400);
   });
 
   it("settings-preview never mutates GitHub state", async () => {
@@ -932,6 +1600,44 @@ describe("api routes", () => {
     expect(payload.warnings).toEqual(expect.arrayContaining([expect.stringContaining("Freshness SLO is degraded")]));
   });
 
+  it("bounds freshness snapshot listings and excludes private local branch targets", async () => {
+    const env = createTestEnv();
+    const nowMs = Date.now();
+    await persistSignalSnapshot(env, {
+      id: "private-local-branch",
+      signalType: "local-branch-analysis",
+      targetKey: `attacker:victim/repo:${"a".repeat(200)}`,
+      repoFullName: "victim/repo",
+      payload: { private: true },
+      generatedAt: new Date(nowMs - 60 * 1000).toISOString(),
+    });
+    await persistSignalSnapshot(env, {
+      id: "oversized-public-target",
+      signalType: "queue-health",
+      targetKey: `owner/repo-${"b".repeat(260)}`,
+      repoFullName: "owner/repo",
+      payload: { ignored: true },
+      generatedAt: new Date(nowMs - 60 * 1000).toISOString(),
+    });
+    for (let index = 0; index < 220; index += 1) {
+      await persistSignalSnapshot(env, {
+        id: `public-target-${index}`,
+        signalType: "queue-health",
+        targetKey: `owner/repo-${index}`,
+        repoFullName: `owner/repo-${index}`,
+        payload: { large: "x".repeat(100) },
+        generatedAt: new Date(nowMs - index * 1000).toISOString(),
+      });
+    }
+
+    const snapshots = await listLatestSignalSnapshotsByTarget(env);
+
+    expect(snapshots).toHaveLength(200);
+    expect(snapshots.some((snapshot) => snapshot.signalType === "local-branch-analysis")).toBe(false);
+    expect(snapshots.some((snapshot) => snapshot.id === "oversized-public-target")).toBe(false);
+    expect(snapshots.every((snapshot) => Object.keys(snapshot.payload).length === 0)).toBe(true);
+  });
+
   it("exposes capped and rate-limited sync segments in readiness and sync status", async () => {
     const app = createApp();
     const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
@@ -1031,7 +1737,7 @@ describe("api routes", () => {
       fetchedCount: 2,
       expectedCount: 2,
       pageCount: 1,
-      completedAt: "2026-05-23T00:00:00.000Z",
+      completedAt: new Date().toISOString(),
       warnings: [],
     });
     const refreshingReadiness = await app.request("/v1/readiness", { headers: apiHeaders(refreshingEnv) }, refreshingEnv);
@@ -1128,6 +1834,8 @@ describe("api routes", () => {
     const toolsPayload = (await mcpJson(toolsList)) as { result: { tools: Array<{ name: string }> } };
     const toolNames = toolsPayload.result.tools.map((tool) => tool.name);
     expect(toolNames).toContain("gittensory_get_repo_context");
+    expect(toolNames).toContain("gittensory_get_issue_quality");
+    expect(toolNames).toContain("gittensory_get_burden_forecast");
     expect(toolNames).toContain("gittensory_get_contributor_profile");
     expect(toolNames).toContain("gittensory_get_decision_pack");
     expect(toolNames).toContain("gittensory_explain_repo_decision");
@@ -1135,6 +1843,7 @@ describe("api routes", () => {
     expect(toolNames).toContain("gittensory_preflight_local_diff");
     expect(toolNames).toContain("gittensory_preview_local_pr_score");
     expect(toolNames).toContain("gittensory_get_registry_changes");
+    expect(toolNames).toContain("gittensory_get_upstream_drift");
     expect(toolNames).toContain("gittensory_explain_review_risk");
     expect(toolNames).toContain("gittensory_compare_pr_variants");
     expect(toolNames).toContain("gittensory_local_status");
@@ -1208,6 +1917,18 @@ describe("api routes", () => {
     const noTotalsPayload = (await mcpJson(noTotalsContext)) as { result: { structuredContent: { queueHealth: { signals: { openIssues: number; openPullRequests: number } } } } };
     expect(noTotalsPayload.result.structuredContent.queueHealth.signals).toMatchObject({ openIssues: 0, openPullRequests: 0 });
 
+    const missingIssueQuality = await app.request(
+      "/mcp",
+      {
+        method: "POST",
+        headers: mcpHeaders(env),
+        body: JSON.stringify({ jsonrpc: "2.0", id: "missing-issue-quality", method: "tools/call", params: { name: "gittensory_get_issue_quality", arguments: { owner: "ghost", repo: "missing" } } }),
+      },
+      env,
+    );
+    expect(missingIssueQuality.status).toBe(200);
+    await expect(mcpJson(missingIssueQuality)).resolves.toMatchObject({ result: { structuredContent: { status: "not_found", repoFullName: "ghost/missing" } } });
+
     for (const [name, args] of [
       ["gittensory_get_decision_pack", { login: "needs-snapshot" }],
       ["gittensory_explain_repo_decision", { login: "needs-snapshot", owner: "entrius", repo: "allways-ui" }],
@@ -1245,8 +1966,114 @@ describe("api routes", () => {
     expect(missingRepoDecision.status).toBe(200);
     await expect(mcpJson(missingRepoDecision)).resolves.toMatchObject({ result: { structuredContent: { status: "not_found", decision: null } } });
 
+    const historicalBountyPreflight = await app.request(
+      "/mcp",
+      {
+        method: "POST",
+        headers: mcpHeaders(env),
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "bounty-preflight",
+          method: "tools/call",
+          params: {
+            name: "gittensory_preflight_pr",
+            arguments: {
+              repoFullName: "entrius/allways-ui",
+              title: "Fix dashboard cache refresh after reconnect",
+              body: "Fixes #7",
+              changedFiles: ["src/cache.ts", "test/cache.test.ts"],
+            },
+          },
+        }),
+      },
+      env,
+    );
+    expect(historicalBountyPreflight.status).toBe(200);
+    const historicalBountyPreflightPayload = (await mcpJson(historicalBountyPreflight)) as { result: { structuredContent: { findings: Array<{ code: string }> } } };
+    expect(historicalBountyPreflightPayload.result.structuredContent.findings.map((finding) => finding.code)).toContain("linked_issue_bounty_historical");
+
+    await persistSignalSnapshot(env, {
+      id: "mcp-issue-quality",
+      signalType: "issue-quality",
+      targetKey: "entrius/allways-ui",
+      repoFullName: "entrius/allways-ui",
+      payload: {
+        repoFullName: "entrius/allways-ui",
+        generatedAt: "2026-05-25T00:00:00.000Z",
+        lane: { lane: "direct_pr" },
+        issues: [{ number: 7, title: "fixture", status: "ready", score: 80, reasons: [], warnings: [] }],
+        summary: "fixture",
+      } as unknown as Record<string, never>,
+      generatedAt: "2026-05-25T00:00:00.000Z",
+    });
+
+    const missingBurdenForecast = await app.request(
+      "/mcp",
+      {
+        method: "POST",
+        headers: mcpHeaders(env),
+        body: JSON.stringify({ jsonrpc: "2.0", id: "missing-burden", method: "tools/call", params: { name: "gittensory_get_burden_forecast", arguments: { owner: "ghost", repo: "nothing" } } }),
+      },
+      env,
+    );
+    expect(missingBurdenForecast.status).toBe(200);
+    await expect(mcpJson(missingBurdenForecast)).resolves.toMatchObject({ result: { structuredContent: { status: "not_found", repoFullName: "ghost/nothing" } } });
+
+    await upsertBurdenForecast(env, {
+      repoFullName: "entrius/allways-ui",
+      payload: { repoFullName: "entrius/allways-ui", level: "low", summary: "mcp fixture", forecast: { projectedReviewLoad: 0, queueGrowthRisk: 0, stalePullRequests: 0, duplicateTrend: 0, reviewablePullRequests: 0 }, findings: [] } as unknown as Record<string, JsonValue>,
+      generatedAt: new Date(Date.now() - 1000).toISOString(),
+    });
+
+    const cachedBurdenForecast = await app.request(
+      "/mcp",
+      {
+        method: "POST",
+        headers: mcpHeaders(env),
+        body: JSON.stringify({ jsonrpc: "2.0", id: "cached-burden", method: "tools/call", params: { name: "gittensory_get_burden_forecast", arguments: { owner: "entrius", repo: "allways-ui" } } }),
+      },
+      env,
+    );
+    expect(cachedBurdenForecast.status).toBe(200);
+    await expect(mcpJson(cachedBurdenForecast)).resolves.toMatchObject({
+      result: {
+        structuredContent: {
+          status: "ready",
+          source: "snapshot",
+          repoFullName: "entrius/allways-ui",
+          freshness: "fresh",
+          report: { level: "low" },
+        },
+      },
+    });
+
+    await upsertRepositoryFromGitHub(env, { name: "mcp-computed-burden", full_name: "entrius/mcp-computed-burden", private: false, owner: { login: "entrius" }, default_branch: "main" });
+    const computedBurdenForecast = await app.request(
+      "/mcp",
+      {
+        method: "POST",
+        headers: mcpHeaders(env),
+        body: JSON.stringify({ jsonrpc: "2.0", id: "computed-burden", method: "tools/call", params: { name: "gittensory_get_burden_forecast", arguments: { owner: "entrius", repo: "mcp-computed-burden" } } }),
+      },
+      env,
+    );
+    expect(computedBurdenForecast.status).toBe(200);
+    await expect(mcpJson(computedBurdenForecast)).resolves.toMatchObject({
+      result: {
+        structuredContent: {
+          status: "ready",
+          source: "computed",
+          repoFullName: "entrius/mcp-computed-burden",
+          freshness: "fresh",
+          report: { repoFullName: "entrius/mcp-computed-burden", level: "low" },
+        },
+      },
+    });
+
     for (const [name, args] of [
       ["gittensory_get_repo_context", { owner: "entrius", repo: "allways-ui" }],
+      ["gittensory_get_issue_quality", { owner: "entrius", repo: "allways-ui" }],
+      ["gittensory_get_burden_forecast", { owner: "entrius", repo: "allways-ui" }],
       ["gittensory_get_contributor_profile", { login: "oktofeesh1" }],
       ["gittensory_get_decision_pack", { login: "oktofeesh1" }],
       ["gittensory_explain_repo_decision", { login: "oktofeesh1", owner: "entrius", repo: "allways-ui" }],
@@ -1261,6 +2088,7 @@ describe("api routes", () => {
         },
       ],
       ["gittensory_get_registry_changes", {}],
+      ["gittensory_get_upstream_drift", {}],
       [
         "gittensory_preview_local_pr_score",
         {
@@ -1687,7 +2515,8 @@ describe("api routes", () => {
     const sessionRejected = await app.request("/v1/auth/github/session", { method: "POST", body: JSON.stringify({ githubToken: "bad" }) }, env);
     expect(sessionRejected.status).toBe(401);
     const unauthenticatedSession = await app.request("/v1/auth/session", {}, env);
-    expect(unauthenticatedSession.status).toBe(401);
+    expect(unauthenticatedSession.status).toBe(200);
+    await expect(unauthenticatedSession.json()).resolves.toMatchObject({ status: "signed_out" });
     const logout = await app.request("/v1/auth/logout", { method: "POST" }, env);
     await expect(logout.json()).resolves.toMatchObject({ ok: true, revoked: false });
 
@@ -2063,6 +2892,53 @@ function apiHeaders(env: Env): Record<string, string> {
   };
 }
 
+function upstreamContractFetch() {
+  const files: Record<string, string> = {
+    "gittensor/constants.py": "SRC_TOK_SATURATION_SCALE = 58\nMAX_CODE_DENSITY_MULTIPLIER = 1.15\n",
+    "gittensor/validator/weights/master_repositories.json": JSON.stringify({
+      "JSONbored/gittensory": {
+        emission_share: 0.01,
+        issue_discovery_share: 0,
+        maintainer_cut: 0.3,
+        label_multipliers: { feature: 1.5 },
+        trusted_label_pipeline: true,
+      },
+    }),
+    "gittensor/validator/weights/programming_languages.json": JSON.stringify({ TypeScript: 1 }),
+    "gittensor/validator/oss_contributions/mirror/scoring.py": "score = 1 - exp(-x)\nsolved_by_pr = True\n",
+    "gittensor/validator/issue_discovery/scan.py": "branch eligibility required\n",
+    "gittensor/utils/mirror/models.py": "solved_by_pr: int\n",
+  };
+  return async (input: RequestInfo | URL): Promise<Response> => {
+    const url = input.toString();
+    if (url.includes("/commits/")) return Response.json({ sha: "api-commit" });
+    const path = Object.keys(files).find((candidate) => url.includes(`/contents/${candidate}`));
+    if (!path) return new Response("not found", { status: 404 });
+    return Response.json({
+      content: Buffer.from(files[path]!, "utf8").toString("base64"),
+      encoding: "base64",
+      sha: `api-${path}`,
+      download_url: `https://raw.githubusercontent.com/entrius/gittensor/test/${path}`,
+    });
+  };
+}
+
+function withBurdenForecastReadFailure(env: Env): Env {
+  const db = env.DB as unknown as { prepare: (sql: string) => unknown; batch: (statements: unknown[]) => Promise<unknown[]> };
+  return {
+    ...env,
+    DB: {
+      prepare(sql: string) {
+        if (/burden_forecasts/i.test(sql)) throw new Error("forecast table unavailable");
+        return db.prepare(sql);
+      },
+      batch(statements: unknown[]) {
+        return db.batch(statements);
+      },
+    } as unknown as D1Database,
+  };
+}
+
 function stubOktofeeshFetch(): void {
   vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
     const url = input.toString();
@@ -2132,6 +3008,9 @@ async function mcpJson(response: Response): Promise<unknown> {
 }
 
 async function seedSignalData(env: Env): Promise<void> {
+  const freshAt = new Date().toISOString();
+  const previousFreshAt = new Date(Date.now() - 60_000).toISOString();
+
   await upsertInstallation(env, {
     installation: {
       id: 123,
@@ -2152,7 +3031,7 @@ async function seedSignalData(env: Env): Promise<void> {
     missingEvents: [],
     permissions: { metadata: "read", pull_requests: "read", issues: "write" },
     events: ["issues", "pull_request", "repository"],
-    checkedAt: "2026-05-23T00:00:00.000Z",
+    checkedAt: freshAt,
   });
   const snapshot = normalizeRegistryPayload(
     {
@@ -2165,7 +3044,7 @@ async function seedSignalData(env: Env): Promise<void> {
       },
     },
     { kind: "raw-github", url: "https://example.test/master_repositories.json" },
-    "2026-05-23T00:00:00.000Z",
+    freshAt,
   );
   await persistRegistrySnapshot(
     env,
@@ -2180,10 +3059,46 @@ async function seedSignalData(env: Env): Promise<void> {
         },
       },
       { kind: "raw-github", url: "https://example.test/old_master_repositories.json" },
-      "2026-05-22T00:00:00.000Z",
+      previousFreshAt,
     ),
   );
   await persistRegistrySnapshot(env, snapshot);
+  await persistUpstreamRulesetSnapshot(env, {
+    id: "upstream-ruleset-seed",
+    sourceRepo: "entrius/gittensor",
+    sourceRef: "test",
+    commitSha: "seed-commit",
+    sourceSnapshotIds: [],
+    activeModel: "pending_saturation_model",
+    registryRepoCount: 1,
+    totalEmissionShare: 0.01107,
+    semanticHash: "seed-semantic-hash",
+    payload: {
+      registry: {
+        repoCount: 1,
+        totalEmissionShare: 0.01107,
+        repositories: [
+          {
+            repo: "entrius/allways-ui",
+            emissionShare: 0.01107,
+            issueDiscoveryShare: 0,
+            maintainerCut: 0,
+            labelMultipliers: { bug: 1.1, enhancement: 1, feature: 1.25, refactor: 0.5 },
+            trustedLabelPipeline: true,
+            defaultLabelMultiplier: null,
+            eligibilityMode: null,
+          },
+        ],
+      },
+      scoring: { activeModel: "pending_saturation_model", constants: { SRC_TOK_SATURATION_SCALE: 58 }, semanticFlags: { usesExponentialSaturation: true } },
+      issueDiscovery: { branchEligibilityRequired: false },
+      mirrorLinkage: { solvedByPrRequired: true },
+      languageWeights: { count: 1, weights: { TypeScript: 1 }, contentHash: "seed-languages" },
+      sourceSnapshots: [],
+    },
+    warnings: [],
+    generatedAt: freshAt,
+  });
   await upsertRepositoryFromGitHub(env, {
     name: "allways-ui",
     full_name: "entrius/allways-ui",
@@ -2195,7 +3110,7 @@ async function seedSignalData(env: Env): Promise<void> {
     id: "scoring-1",
     sourceKind: "test",
     sourceUrl: "fixture://scoring",
-    fetchedAt: "2026-05-23T00:00:00.000Z",
+    fetchedAt: freshAt,
     activeModel: "current_density_model",
     constants: {
       OSS_EMISSION_SHARE: 0.9,
@@ -2240,7 +3155,7 @@ async function seedSignalData(env: Env): Promise<void> {
     closedUnmergedPullRequestsTotal: 0,
     labelsTotal: 2,
     sourceKind: "github",
-    fetchedAt: "2026-05-23T00:00:00.000Z",
+    fetchedAt: freshAt,
     payload: {},
   });
   await Promise.all(
@@ -2263,7 +3178,7 @@ async function seedSignalData(env: Env): Promise<void> {
         fetchedCount: record.fetchedCount,
         expectedCount: record.expectedCount,
         pageCount: 1,
-        completedAt: "2026-05-23T00:00:00.000Z",
+        completedAt: freshAt,
         warnings: [],
       }),
     ),
@@ -2297,7 +3212,7 @@ async function seedSignalData(env: Env): Promise<void> {
     missingEvents: [],
     permissions: { metadata: "read", pull_requests: "read", issues: "write" },
     events: ["issues", "issue_comment", "pull_request", "repository"],
-    checkedAt: "2026-05-23T00:00:00.000Z",
+    checkedAt: freshAt,
   });
   await upsertIssueFromGitHub(env, "entrius/allways-ui", {
     number: 7,
@@ -2333,10 +3248,10 @@ async function seedSignalData(env: Env): Promise<void> {
     repoFullName: "entrius/allways-ui",
     pullNumber: 12,
     status: "complete",
-    filesSyncedAt: "2026-05-23T00:00:00.000Z",
-    reviewsSyncedAt: "2026-05-23T00:00:00.000Z",
-    checksSyncedAt: "2026-05-23T00:00:00.000Z",
-    lastSyncedAt: "2026-05-23T00:00:00.000Z",
+    filesSyncedAt: freshAt,
+    reviewsSyncedAt: freshAt,
+    checksSyncedAt: freshAt,
+    lastSyncedAt: freshAt,
   });
   await upsertPullRequestFile(env, {
     repoFullName: "entrius/allways-ui",
@@ -2381,10 +3296,10 @@ async function seedSignalData(env: Env): Promise<void> {
     repoFullName: "entrius/allways-ui",
     pullNumber: 13,
     status: "complete",
-    filesSyncedAt: "2026-05-23T00:00:00.000Z",
-    reviewsSyncedAt: "2026-05-23T00:00:00.000Z",
-    checksSyncedAt: "2026-05-23T00:00:00.000Z",
-    lastSyncedAt: "2026-05-23T00:00:00.000Z",
+    filesSyncedAt: freshAt,
+    reviewsSyncedAt: freshAt,
+    checksSyncedAt: freshAt,
+    lastSyncedAt: freshAt,
   });
   await upsertRecentMergedPullRequest(env, {
     repoFullName: "entrius/allways-ui",

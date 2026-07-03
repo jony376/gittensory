@@ -90,7 +90,9 @@ export function buildManageStatusSnapshot(readers) {
   }
 
   return [...rows.values()].sort((left, right) => {
-    const repoCompare = left.repoFullName.localeCompare(right.repoFullName);
+    const repoCompare = left.repoFullName
+      .toLowerCase()
+      .localeCompare(right.repoFullName.toLowerCase(), "en");
     if (repoCompare !== 0) return repoCompare;
     return left.pullNumber - right.pullNumber;
   });
@@ -139,9 +141,11 @@ export function formatManageStatusTable(rows) {
   return `${lines.join("\n")}\n`;
 }
 
+const globalCliFlags = new Set(["--json", "--no-update-check"]);
+
 export function parseManageStatusArgs(cliArgs) {
   const json = cliArgs.includes("--json");
-  const positional = cliArgs.filter((arg) => arg !== "--json");
+  const positional = cliArgs.filter((arg) => !globalCliFlags.has(arg));
   if (positional.length > 0) {
     throw new Error(`unexpected_arguments:${positional.join(",")}`);
   }

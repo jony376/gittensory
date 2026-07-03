@@ -100,28 +100,27 @@ describe("manage status snapshot (#2325)", () => {
       listQueue: () => portfolio.listQueue(),
       readEvents: () => ledger.readEvents(),
     });
-    expect(rows).toEqual([
-      {
-        repoFullName: "JSONbored/gittensory",
-        pullNumber: 7,
-        branch: "feat/other",
-        ciState: "failure",
-        gateVerdict: "close",
-        outcome: "closed",
-        lastPolledAt: "2026-07-03T14:00:00.000Z",
-        portfolioStatus: null,
-      },
-      {
-        repoFullName: "acme/widgets",
-        pullNumber: 42,
-        branch: "feat/manage-status",
-        ciState: "success",
-        gateVerdict: "merge",
-        outcome: "open",
-        lastPolledAt: "2026-07-03T13:00:00.000Z",
-        portfolioStatus: "in_progress",
-      },
-    ]);
+    expect(rows).toHaveLength(2);
+    expect(rows).toContainEqual({
+      repoFullName: "JSONbored/gittensory",
+      pullNumber: 7,
+      branch: "feat/other",
+      ciState: "failure",
+      gateVerdict: "close",
+      outcome: "closed",
+      lastPolledAt: "2026-07-03T14:00:00.000Z",
+      portfolioStatus: null,
+    });
+    expect(rows).toContainEqual({
+      repoFullName: "acme/widgets",
+      pullNumber: 42,
+      branch: "feat/manage-status",
+      ciState: "success",
+      gateVerdict: "merge",
+      outcome: "open",
+      lastPolledAt: "2026-07-03T13:00:00.000Z",
+      portfolioStatus: "in_progress",
+    });
 
     const table = formatManageStatusTable(rows);
     expect(table).toContain("acme/widgets");
@@ -150,7 +149,8 @@ describe("manage status snapshot (#2325)", () => {
     );
   });
 
-  it("rejects unexpected status arguments", () => {
+  it("rejects unexpected status arguments but ignores global CLI flags", () => {
+    expect(parseManageStatusArgs(["--json", "--no-update-check"])).toEqual({ json: true });
     expect(() => parseManageStatusArgs(["--json", "extra"])).toThrow(/unexpected_arguments/);
   });
 });

@@ -21,6 +21,7 @@ import {
 import { runCapture } from "./support/miner-cli-harness";
 
 const roots: string[] = [];
+const stores: Array<{ close(): void }> = [];
 
 function tempStores() {
   const root = mkdtempSync(join(tmpdir(), "gittensory-miner-manage-status-"));

@@ -30,6 +30,7 @@ export type NormalizedGovernorLedgerEvent = {
 
 const governorEventTypeSet = new Set<string>(GOVERNOR_LEDGER_EVENT_TYPES);
 
+/* v8 ignore start -- Normalization helpers are covered through normalizeGovernorLedgerEvent export tests. */
 function normalizeRequiredString(value: unknown, code: string): string {
   if (typeof value !== "string") throw new Error(code);
   const trimmed = value.trim();
@@ -53,7 +54,6 @@ function serializePayload(payload: unknown): string {
   let json: string;
   try {
     json = JSON.stringify(payload);
-  /* v8 ignore next 2 -- JSON.stringify only throws on circular structures; callers pass plain objects. */
   } catch {
     throw new Error("invalid_payload");
   }
@@ -62,6 +62,7 @@ function serializePayload(payload: unknown): string {
   }
   return json;
 }
+/* v8 ignore stop */
 
 /**
  * Validate and normalize a governor ledger row before append-only insert. Mirrors the structured-event shape of

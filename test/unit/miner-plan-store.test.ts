@@ -82,6 +82,15 @@ describe("gittensory-miner plan store (#2318)", () => {
     expect(() => store.listPlans({ status: "bogus" as never })).toThrow("invalid_status");
   });
 
+  it("treats a null listPlans status filter as unscoped", () => {
+    const store = tempStore();
+    store.savePlan("a", PLAN);
+    store.savePlan("b", {
+      steps: [{ id: "x", title: "done", dependsOn: [], status: "completed", attempts: 1, maxAttempts: 1 }],
+    });
+    expect(store.listPlans({ status: null }).map((record) => record.planId)).toEqual(["a", "b"]);
+  });
+
   it("rejects a malformed plan on save rather than persisting it", () => {
     const store = tempStore();
     expect(() => store.savePlan("x", { steps: [{ id: "s1", title: "no status", dependsOn: [], attempts: 0, maxAttempts: 1 } as never] })).toThrow("invalid_plan");

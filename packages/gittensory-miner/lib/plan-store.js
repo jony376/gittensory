@@ -47,6 +47,12 @@ function normalizePlanId(planId) {
   return planId.trim();
 }
 
+function normalizePlanStatusFilter(status) {
+  if (status === undefined || status === null) return undefined;
+  if (!planStatusSet.has(status)) throw new Error("invalid_status");
+  return status;
+}
+
 function isBoundedString(value, min, max) {
   return typeof value === "string" && value.length >= min && value.length <= max;
 }
@@ -167,9 +173,9 @@ export function openPlanStore(dbPath = resolvePlanStoreDbPath()) {
       return row ? rowToRecord(row) : null;
     },
     listPlans(filter = {}) {
-      if (filter.status !== undefined) {
-        if (!planStatusSet.has(filter.status)) throw new Error("invalid_status");
-        return listStatusStatement.all(filter.status).map(rowToRecord);
+      const status = normalizePlanStatusFilter(filter.status);
+      if (status !== undefined) {
+        return listStatusStatement.all(status).map(rowToRecord);
       }
       return listAllStatement.all().map(rowToRecord);
     },

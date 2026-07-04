@@ -46,6 +46,10 @@ export {
 } from "./opportunity-freshness.js";
 export { computeOpportunityCompetition } from "./opportunity-competition.js";
 export {
+  computeLaneFit,
+  type GoalModelInput,
+} from "./goal-model.js";
+export {
   classifyContributorFit,
   type ContributorFit,
   type ContributorFitCheck,

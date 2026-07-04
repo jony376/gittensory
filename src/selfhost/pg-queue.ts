@@ -134,10 +134,12 @@ import {
   type MaintenancePressureSignals,
 } from "./maintenance-admission";
 import {
+  AGENT_REGATE_PR_JOB_KEY_PREFIX,
   backlogRepoCandidatesFromJobKeys,
   foregroundLaneForJob,
   nextForegroundLane,
   pickBacklogRepo,
+  type BacklogRepoCount,
   type ForegroundLane,
 } from "./queue-fairness";
 import {
@@ -210,6 +212,9 @@ export interface PgDurableQueue {
    *  boot and on a timer while running (see init()/start()), and exposed directly so tests and an
    *  operator-triggered repair path don't have to wait for the real interval. Returns the number released. */
   releaseStaleForegroundDeferrals(): Promise<number>;
+  /** Top-N repos by backlog-convergence pending depth, for the observability dashboard's per-repo backlog panel
+   *  (#selfhost-lane-observability). */
+  topBacklogRepos(limit: number): Promise<BacklogRepoCount[]>;
 }
 
 interface JobRow {
@@ -406,6 +411,9 @@ export function createPgQueue(
     const backlogConvergenceRes = await pool.query(
       `SELECT COUNT(*) AS cnt FROM ${TABLE} WHERE status IN ('pending','processing') AND foreground_lane='backlog'`,
     );
+    const freshIntakeRes = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM ${TABLE} WHERE status IN ('pending','processing') AND foreground_lane='fresh'`,
+    );
     const live = liveRes.rows[0] as {
       cnt: string | number;
       oldest: string | number | null;
@@ -414,6 +422,7 @@ export function createPgQueue(
     };
     const maintenance = maintenanceRes.rows[0] as { cnt: string | number; oldest: string | number | null };
     const backlogConvergence = backlogConvergenceRes.rows[0] as { cnt: string | number };
+    const freshIntake = freshIntakeRes.rows[0] as { cnt: string | number };
     return {
       livePendingCount: Number(live.cnt),
       oldestLivePendingAgeMs: live.oldest != null ? now - Number(live.oldest) : null,
@@ -422,8 +431,42 @@ export function createPgQueue(
       maintenancePendingCount: Number(maintenance.cnt),
       oldestMaintenancePendingAgeMs: maintenance.oldest != null ? now - Number(maintenance.oldest) : null,
       backlogConvergencePendingCount: Number(backlogConvergence.cnt),
+      freshIntakePendingCount: Number(freshIntake.cnt),
       hostLoadAvg1PerCore: hostLoadAvg1PerCore(),
     };
+  }
+
+  /** Top-N repos by backlog-convergence pending DEPTH, for the observability dashboard's per-repo backlog panel
+   *  (#selfhost-lane-observability) -- a snapshot read, distinct from claimNextForegroundLane's own backlog
+   *  query (which is scoped to run_after<=now and only reads job_key+created_at for the round-robin picker).
+   *  This one counts EVERY pending+processing backlog-lane row regardless of run_after, matching the "how deep
+   *  is each repo's backlog right now" framing of a dashboard panel rather than a claim-time eligibility set.
+   *  The COUNT/GROUP BY/ORDER BY/LIMIT run IN SQL (gate review, #selfhost-lane-observability) -- a self-host
+   *  install with a large real backlog must never pull every matching job_key into JS on every /metrics scrape
+   *  just to throw away all but the top 10; only the final, already-bounded rows ever leave the DB. */
+  async function topBacklogRepos(limit: number): Promise<BacklogRepoCount[]> {
+    const res = await pool.query(
+      `WITH backlog_rest AS (
+         SELECT substring(job_key, length($1) + 1) AS rest
+           FROM ${TABLE}
+          WHERE status IN ('pending','processing') AND foreground_lane='backlog' AND job_key LIKE $2
+       ),
+       backlog_repos AS (
+         SELECT CASE WHEN position('#' in rest) > 0 THEN substring(rest, 1, position('#' in rest) - 1) ELSE rest END AS repo
+           FROM backlog_rest
+       )
+       SELECT repo, COUNT(*) AS cnt
+         FROM backlog_repos
+        WHERE repo != ''
+        GROUP BY repo
+        ORDER BY cnt DESC, repo ASC
+        LIMIT $3`,
+      [AGENT_REGATE_PR_JOB_KEY_PREFIX, `${AGENT_REGATE_PR_JOB_KEY_PREFIX}%`, Math.max(0, limit)],
+    );
+    return (res.rows as Array<{ repo: string; cnt: string | number }>).map((row) => ({
+      repo: row.repo,
+      count: Number(row.cnt),
+    }));
   }
 
   async function recoverProcessingJobs(): Promise<number> {
@@ -787,7 +830,9 @@ export function createPgQueue(
     const sequence = fairness ? Number(fairness.claim_sequence) : 0;
     const lane: ForegroundLane = nextForegroundLane(sequence);
     if (lane === "fresh") {
-      return claimNextWhere(now, "priority >= $2", { sql: "foreground_lane='fresh'", params: [] });
+      const freshRow = await claimNextWhere(now, "priority >= $2", { sql: "foreground_lane='fresh'", params: [] });
+      if (freshRow) incr("gittensory_jobs_claimed_by_lane_total", { lane: "fresh" });
+      return freshRow;
     }
     const backlogRes = await pool.query(
       `SELECT job_key, created_at FROM ${TABLE} WHERE status='pending' AND run_after<=$1 AND foreground_lane='backlog'`,
@@ -808,6 +853,7 @@ export function createPgQueue(
     });
     if (row) {
       await pool.query(`UPDATE ${FAIRNESS_TABLE} SET last_backlog_repo=$1 WHERE id='singleton'`, [repo]);
+      incr("gittensory_jobs_claimed_by_lane_total", { lane: "backlog" });
     }
     return row;
   }
@@ -1288,6 +1334,7 @@ export function createPgQueue(
     pressureSignals() {
       return maintenancePressureSignals(Date.now());
     },
+    topBacklogRepos,
   };
 
   async function reclaimExpiredProcessingJobs(): Promise<number> {

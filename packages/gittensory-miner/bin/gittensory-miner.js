@@ -2,6 +2,8 @@
 import { createRequire } from "node:module";
 import { printHelp, printVersion, runCli } from "../lib/cli.js";
 import { runDenyCheck } from "../lib/deny-check.js";
+import { runStateCli } from "../lib/run-state-cli.js";
+import { runDoctor, runStatus } from "../lib/status.js";
 import {
   awaitOpportunisticUpdateCheck,
   resolveUpgradeCommand,
@@ -9,6 +11,18 @@ import {
 } from "../lib/update-check.js";
 
 const cliArgs = process.argv.slice(2);
+
+// `status` and `doctor` are strictly local, offline commands — their contract is to make NO network calls. Dispatch
+// them BEFORE the opportunistic npm-registry update check is even started, so they can never reach that network
+// path (the update check runs for the remaining commands below).
+if (cliArgs[0] === "status") {
+  process.exit(runStatus(cliArgs.slice(1)));
+}
+
+if (cliArgs[0] === "doctor") {
+  process.exit(runDoctor(cliArgs.slice(1)));
+}
+
 const require = createRequire(import.meta.url);
 const packageName = "@jsonbored/gittensory-miner";
 const packageVersion = require("../package.json").version;
@@ -48,19 +62,25 @@ if (cliArgs[0] === "hooks" && cliArgs[1] === "check") {
   process.exit(exitCode);
 }
 
-if (cliArgs[0] === "status") {
+if (cliArgs[0] === "state") {
+  const exitCode = runStateCli(cliArgs[1], cliArgs.slice(2));
+  await awaitOpportunisticUpdateCheck(updateCheck);
+  process.exit(exitCode);
+}
+
+if (cliArgs[0] === "manage" && cliArgs[1] === "status") {
   const { listQueue } = await import("../lib/portfolio-queue.js");
   const { readEvents } = await import("../lib/event-ledger.js");
   const { parseManageStatusArgs, runManageStatus } = await import("../lib/manage-status.js");
   try {
-    const options = parseManageStatusArgs(cliArgs.slice(1));
+    const options = parseManageStatusArgs(cliArgs.slice(2));
     const result = runManageStatus({ listQueue, readEvents }, options);
     process.stdout.write(result.output);
     await awaitOpportunisticUpdateCheck(updateCheck);
     process.exit(result.exitCode);
   } catch (error) {
     const message = error instanceof Error ? error.message : "manage_status_failed";
-    console.error(`status failed: ${message}`);
+    console.error(`manage status failed: ${message}`);
     await awaitOpportunisticUpdateCheck(updateCheck);
     process.exit(1);
   }

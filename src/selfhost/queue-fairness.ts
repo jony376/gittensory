@@ -88,7 +88,11 @@ export function pickBacklogRepo(candidates: readonly BacklogRepoCandidate[], las
   return (sorted[(lastIndex + 1) % sorted.length] as BacklogRepoCandidate).repo;
 }
 
-const AGENT_REGATE_PR_JOB_KEY_PREFIX = "agent-regate-pr:";
+// Exported so the queue backends' own topBacklogRepos SQL (COUNT/GROUP BY/ORDER BY/LIMIT pushed into the
+// database, #selfhost-lane-observability gate review) can bind the identical prefix rather than duplicating
+// the literal — this module stays the single source of truth for the `agent-regate-pr:{repo}#{pr}` job_key
+// shape (queue-common.ts's jobCoalesceKey).
+export const AGENT_REGATE_PR_JOB_KEY_PREFIX = "agent-regate-pr:";
 
 /**
  * Derive per-repo backlog candidates from raw pending backlog-lane job rows (job_key + created_at), rather than
@@ -115,3 +119,5 @@ export function backlogRepoCandidatesFromJobKeys(
   }
   return [...oldestAgeByRepo.entries()].map(([repo, oldestPendingAgeMs]) => ({ repo, oldestPendingAgeMs }));
 }
+
+export type BacklogRepoCount = { repo: string; count: number };

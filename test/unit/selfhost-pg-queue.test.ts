@@ -69,15 +69,16 @@ interface MockPool {
    *  on a specific row (rowCount 0) while another succeeds (rowCount 1). */
   setReviveUpdateRowCounts(rowCounts: number[]): void;
   setRateLimitRows(rows: Array<{ admission_key?: string | null; repo_full_name?: string | null; remaining: number | string | null; reset_at: string | null; observed_at?: string | null }>): void;
-  /** Configures the three maintenance-admission pressure aggregate queries (live + maintenance + backlog-
-   *  convergence lane). Defaults to zero pending / null oldest in all lanes (pressure clear) until set.
-   *  `runnableCnt`/`oldestRunnable` back the #selfhost-queue-liveness runnable-now split (see
+  /** Configures the four maintenance-admission pressure aggregate queries (live + maintenance + backlog-
+   *  convergence + fresh-intake lane). Defaults to zero pending / null oldest in all lanes (pressure clear)
+   *  until set. `runnableCnt`/`oldestRunnable` back the #selfhost-queue-liveness runnable-now split (see
    *  maintenancePressureSignals's FILTER columns); they default to 0/null (nothing runnable) so existing tests
    *  that never set them keep working. */
   setPressureSignals(signals: {
     live?: { cnt: number; oldest: number | null; runnableCnt?: number; oldestRunnable?: number | null };
     maintenance?: { cnt: number; oldest: number | null };
     backlogConvergence?: { cnt: number };
+    freshIntake?: { cnt: number };
   }): void;
   /** Programs the exact rows returned by releaseStaleForegroundDeferrals' candidate SELECT
    *  (`WHERE status='pending' AND priority>=$1 AND run_after>$2`), and the per-row rowCount its conditional
@@ -105,6 +106,7 @@ function makePool(): MockPool {
   };
   let pressureMaintenance: { cnt: number; oldest: number | null } = { cnt: 0, oldest: null };
   let pressureBacklogConvergence: { cnt: number } = { cnt: 0 };
+  let pressureFreshIntake: { cnt: number } = { cnt: 0 };
   let foregroundLivenessCandidates: Array<{ id: string; created_at: number; payload?: string }> = [];
   const foregroundLivenessUpdateRowCounts: number[] = [];
   const DEFAULT_FOREGROUND_LIVENESS_PAYLOAD = JSON.stringify({
@@ -151,6 +153,9 @@ function makePool(): MockPool {
     }
     if (q.includes("AS cnt") && q.includes("foreground_lane='backlog'")) {
       return { rows: [{ cnt: String(pressureBacklogConvergence.cnt) }], rowCount: 1 };
+    }
+    if (q.includes("AS cnt") && q.includes("foreground_lane='fresh'")) {
+      return { rows: [{ cnt: String(pressureFreshIntake.cnt) }], rowCount: 1 };
     }
     if (q.includes("FROM github_rate_limit_observations")) {
       const admissionKey = typeof params?.[0] === "string" ? params[0] : null;
@@ -213,6 +218,7 @@ function makePool(): MockPool {
       if (signals.live) pressureLive = signals.live;
       if (signals.maintenance) pressureMaintenance = signals.maintenance;
       if (signals.backlogConvergence) pressureBacklogConvergence = signals.backlogConvergence;
+      if (signals.freshIntake) pressureFreshIntake = signals.freshIntake;
     },
     setRateLimitRows(rows) {
       rateLimitRows = rows;
@@ -1015,6 +1021,7 @@ describe("createPgQueue (durable #977)", () => {
       expect(claimSql[0]).toContain("foreground_lane='backlog'");
       expect(sequenceAllocations).toBeGreaterThan(0);
       expect(repoRecorded).toBe("owner/repo");
+      expect(await renderMetrics()).toContain('gittensory_jobs_claimed_by_lane_total{lane="backlog"} 1');
     });
 
     it("falls through to the plain unscoped foreground claim when the backlog lane has no pending candidates", async () => {
@@ -1052,6 +1059,36 @@ describe("createPgQueue (durable #977)", () => {
       // query, which still finds the untagged foreground row rather than stalling.
       expect(seen).toEqual(["recapture-preview"]);
       expect(claimSql[0]).not.toContain("foreground_lane");
+      // The unscoped fallback claim is not lane-scoped, so it must never record a lane-claim increment
+      // (#selfhost-lane-observability).
+      expect(await renderMetrics()).not.toContain("gittensory_jobs_claimed_by_lane_total");
+    });
+
+    it("records the fresh-intake lane-claim counter on a successful fresh-lane claim (#selfhost-lane-observability)", async () => {
+      let claimed = false; // one-shot: the row is only claimable until the first successful claim
+      const fn = vi.fn().mockImplementation(async (sql: unknown) => {
+        const q = String(sql);
+        // Sequence 3 (the default 3-backlog:1-fresh ratio's 4th slot) prefers "fresh".
+        if (q.includes("UPDATE _selfhost_queue_fairness SET claim_sequence=claim_sequence+1") && q.includes("RETURNING claim_sequence, last_backlog_repo")) {
+          return { rows: [{ claim_sequence: 3, last_backlog_repo: null }], rowCount: 1 };
+        }
+        if (!claimed && q.includes("UPDATE _selfhost_jobs SET status='processing'") && q.includes("foreground_lane='fresh'")) {
+          claimed = true;
+          return {
+            rows: [{ id: "fresh-1", payload: JSON.stringify(msg("github-webhook")), attempts: 0, job_key: "github-webhook:owner/repo#1@sha", priority: 10, created_at: 1000 }],
+            rowCount: 1,
+          };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const seen: string[] = [];
+      const q = createPgQueue({ query: fn } as unknown as Pool, async (m) => void seen.push(typeOf(m)));
+
+      await q.init();
+      await q.drain();
+
+      expect(seen).toEqual(["github-webhook"]);
+      expect(await renderMetrics()).toContain('gittensory_jobs_claimed_by_lane_total{lane="fresh"} 1');
     });
 
     it("allocates the claim sequence atomically via UPDATE ... RETURNING, not a separate SELECT-then-UPDATE (#selfhost-backlog-convergence review)", async () => {
@@ -1122,6 +1159,65 @@ describe("createPgQueue (durable #977)", () => {
         expect.stringContaining("UPDATE _selfhost_jobs SET foreground_lane=$1"),
         ["backlog", "legacy"],
       );
+    });
+  });
+
+  describe("topBacklogRepos (#selfhost-lane-observability)", () => {
+    // The COUNT/GROUP BY/ORDER BY/LIMIT run IN SQL now (gate review) -- this mock can't execute real SQL, so it
+    // returns a pre-aggregated {repo, cnt} result set (as the real query would) and these tests verify (a) the
+    // query is scoped to the backlog lane + the agent-regate-pr job_key prefix with the limit bound as a
+    // parameter, and (b) the {repo, cnt} rows map to {repo, count} correctly. The aggregation SQL itself
+    // (substring/position extraction, GROUP BY, ORDER BY, exclusion of dead/fresh-lane/no-hash-edge rows) is
+    // verified directly against a real Postgres instance and, identically, against the real SQLite engine in
+    // selfhost-sqlite-queue.test.ts (both backends share the same query shape).
+    function stubAggregatedBacklogRepos(rows: Array<{ repo: string; cnt: string | number }>): {
+      pool: { query: Pool["query"] };
+      calls: Array<{ sql: string; params: unknown[] }>;
+    } {
+      const calls: Array<{ sql: string; params: unknown[] }> = [];
+      return {
+        pool: {
+          query: (async (sql: unknown, params?: unknown[]) => {
+            const q = String(sql);
+            if (q.includes("foreground_lane='backlog'") && q.includes("GROUP BY repo")) {
+              calls.push({ sql: q, params: params ?? [] });
+              return { rows, rowCount: rows.length };
+            }
+            return { rows: [], rowCount: 0 };
+          }) as Pool["query"],
+        },
+        calls,
+      };
+    }
+
+    it("returns an empty array when no backlog-lane row is pending", async () => {
+      const m = stubAggregatedBacklogRepos([]);
+      const q = createPgQueue(m.pool as unknown as Pool, async () => undefined);
+      expect(await q.topBacklogRepos(10)).toEqual([]);
+    });
+
+    it("maps aggregated {repo, cnt} rows to {repo, count}, binding the prefix, LIKE pattern, and limit as params", async () => {
+      const m = stubAggregatedBacklogRepos([
+        { repo: "owner/b", cnt: "3" },
+        { repo: "owner/a", cnt: 1 },
+      ]);
+      const q = createPgQueue(m.pool as unknown as Pool, async () => undefined);
+
+      expect(await q.topBacklogRepos(2)).toEqual([
+        { repo: "owner/b", count: 3 },
+        { repo: "owner/a", count: 1 },
+      ]);
+      expect(m.calls).toHaveLength(1);
+      expect(m.calls[0]?.params).toEqual(["agent-regate-pr:", "agent-regate-pr:%", 2]);
+      expect(m.calls[0]?.sql).toContain("status IN ('pending','processing')");
+    });
+
+    it("clamps a negative limit to 0 rather than passing it through to SQL (LIMIT -1 means unlimited in some dialects)", async () => {
+      const m = stubAggregatedBacklogRepos([]);
+      const q = createPgQueue(m.pool as unknown as Pool, async () => undefined);
+
+      await q.topBacklogRepos(-5);
+      expect(m.calls[0]?.params).toEqual(["agent-regate-pr:", "agent-regate-pr:%", 0]);
     });
   });
 
@@ -2641,12 +2737,13 @@ describe("createPgQueue (durable #977)", () => {
       expect(await renderMetrics()).not.toContain("gittensory_jobs_maintenance_admission_granted_under_pressure_total");
     });
 
-    it("pressureSignals() surfaces the live, maintenance, and backlog-convergence aggregate reads", async () => {
+    it("pressureSignals() surfaces the live, maintenance, backlog-convergence, and fresh-intake aggregate reads", async () => {
       const m = makePool();
       m.setPressureSignals({
         live: { cnt: 2, oldest: now - 1_000 },
         maintenance: { cnt: 4, oldest: now - 2_000 },
         backlogConvergence: { cnt: 3 },
+        freshIntake: { cnt: 5 },
       });
       const q = createPgQueue(m.pool, async () => undefined);
       const signals = await q.pressureSignals();
@@ -2658,6 +2755,7 @@ describe("createPgQueue (durable #977)", () => {
         maintenancePendingCount: 4,
         oldestMaintenancePendingAgeMs: expect.any(Number),
         backlogConvergencePendingCount: 3,
+        freshIntakePendingCount: 5,
         hostLoadAvg1PerCore: null,
       });
     });

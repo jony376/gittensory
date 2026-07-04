@@ -22,7 +22,7 @@ import { ensurePullRequestLabel, removePullRequestLabel } from "../github/labels
 import { closeIssue, closePullRequest, createIssueComment, createPullRequestReview, dismissLatestBotApproval, mergePullRequest, updatePullRequestBranch } from "../github/pr-actions";
 import { fetchPullRequestFreshness, pullRequestFreshnessDetail } from "../github/pr-freshness";
 import { isActingAutonomyLevel, resolveAutonomy } from "../settings/autonomy";
-import { buildAgentActionAudit, isGlobalAgentPause, resolveAgentActionMode, resolveAgentPermissionReadiness, type AgentActionMode } from "../settings/agent-execution";
+import { buildAgentActionAudit, formatAgentPermissionDenial, isGlobalAgentPause, resolveAgentActionMode, resolveAgentPermissionReadiness, type AgentActionMode } from "../settings/agent-execution";
 import type { PlannedAgentAction } from "../settings/agent-actions";
 import type { AgentActionClass, AgentPendingActionParams, AutonomyLevel, AutonomyPolicy } from "../types";
 import { errorMessage } from "../utils/json";
@@ -40,10 +40,9 @@ import { incr } from "../selfhost/metrics";
 // autonomy (the config IS the authorization; there is no human commenter to authorize, unlike #824).
 const AGENT_ACTOR = "gittensory";
 
-// The PR-state action classes that require GitHub `pull_requests: write`. `label` mutates via the Issues API
-// (`issues: write`, always held), so it is exempt from the write-permission readiness gate. Exported so the
-// agent-execution test can enforce the invariant that every member is also counted by agentRequiresPrWrite
-// (PR_WRITE_ACTION_CLASSES is a superset), so this runtime guard never disagrees with the readiness gate.
+// The PR-visible action classes that require an elevated GitHub App write permission. Most use
+// `pull_requests: write`; merge uses `contents: write`; `label` mutates through the Issues API, so it is exempt
+// from this readiness gate.
 export const PR_WRITE_CLASSES = new Set<AgentActionClass>(["request_changes", "approve", "merge", "close", "update_branch"]);
 
 const INSTALLATION_HEALTH_REFRESH_COOLDOWN_MS = 5 * 60 * 1000;
@@ -56,6 +55,11 @@ function shouldRefreshInstallationHealthAfterPrWriteFailure(installationId: numb
   if (lastAttemptMs !== undefined && nowMs - lastAttemptMs < INSTALLATION_HEALTH_REFRESH_COOLDOWN_MS) return false;
   installationHealthRefreshAttempts.set(installationId, nowMs);
   return true;
+}
+
+/** Test-only: clear the module-level installation health refresh cooldown so each test starts fresh. */
+export function clearInstallationHealthRefreshCooldownForTest(): void {
+  installationHealthRefreshAttempts.clear();
 }
 
 // A known-denied PR-write action (missing pull_requests:write) must not re-run the freshness + live-CI GitHub
@@ -212,11 +216,11 @@ export async function executeAgentMaintenanceActions(env: Env, ctx: AgentActionE
       await audit("queued", `awaiting maintainer approval — ${action.reason}`);
       continue;
     }
-    // 5) Write-permission readiness: a PR-write action needs `pull_requests: write` granted. Checked here --
-    //    before the freshness/live-CI GitHub calls below -- so a known-denied action never spends that API
-    //    budget on an outcome that cannot change until the maintainer re-consents (#selfhost-runtime-drift).
-    //    `label` mutates via the Issues API (`issues: write`, always held), so it is exempt from this gate.
-    if (PR_WRITE_CLASSES.has(action.actionClass) && resolveAgentPermissionReadiness({ autonomy: ctx.autonomy, installationPermissions: ctx.installationPermissions }) !== "ready") {
+    // 5) Write-permission readiness: a PR-visible action needs its exact GitHub App write permission granted.
+    //    Merge is Contents: write, while review/close/update_branch are Pull requests: write. Checked here
+    //    before the freshness/live-CI GitHub calls below so a known-denied action never spends that API budget on
+    //    an outcome that cannot change until the maintainer re-consents (#selfhost-runtime-drift).
+    if (PR_WRITE_CLASSES.has(action.actionClass) && resolveAgentPermissionReadiness({ autonomy: ctx.autonomy, installationPermissions: ctx.installationPermissions, actionClass: action.actionClass }) !== "ready") {
       incr("gittensory_agent_action_permission_denied_total", { actionClass: action.actionClass });
       const cooldownKey = writePermissionDenialKey(ctx.installationId, ctx.repoFullName, ctx.pullNumber, action.actionClass);
       if (shouldSuppressWritePermissionDenial(cooldownKey, Date.now())) {
@@ -226,11 +230,11 @@ export async function executeAgentMaintenanceActions(env: Env, ctx: AgentActionE
         outcomes.push({
           actionClass: action.actionClass,
           outcome: "denied",
-          detail: "pull_requests: write not granted — maintainer must re-consent (suppressed repeat)",
+          detail: formatAgentPermissionDenial({ autonomy: ctx.autonomy, installationPermissions: ctx.installationPermissions, actionClass: action.actionClass, suppressed: true }),
         });
         continue;
       }
-      await audit("denied", "pull_requests: write not granted — maintainer must re-consent");
+      await audit("denied", formatAgentPermissionDenial({ autonomy: ctx.autonomy, installationPermissions: ctx.installationPermissions, actionClass: action.actionClass }));
       markWritePermissionDenialAudited(cooldownKey, Date.now());
       continue;
     }
@@ -335,9 +339,9 @@ export async function executeAgentMaintenanceActions(env: Env, ctx: AgentActionE
       }
     } catch (error) {
       await audit("error", errorMessage(error));
-      // RC3 terminal-fail merges: a merge that fails on perms (403/405) / required-check-absent (409) / a real
-      // conflict can NEVER complete for this commit — mark it terminally merge-blocked so the planner stops
-      // re-planning it every sweep. A possibly-transient failure is retried up to MERGE_RETRY_CAP then held.
+      // RC3 terminal-fail merges: immediate terminal failures (401/405/409/conflict) are marked once; generic
+      // GitHub 403s are retryable first because branch-protection/check/conversation state can converge shortly
+      // after the gate publishes. A possibly-transient failure is retried up to MERGE_RETRY_CAP, then held.
       if (action.actionClass === "merge" && ctx.headSha) {
         await handleMergeFailure(env, ctx, error);
       }
@@ -558,11 +562,9 @@ export async function executeIssueMaintenanceActions(env: Env, ctx: IssueActionE
   return outcomes;
 }
 
-// RC3: persist the outcome of a FAILED merge so it is never retried blindly forever. A non-transient failure
-// (403/405 perms, 409 required-check-absent, merge conflict) is terminal immediately; an otherwise-unclassified
-// failure (e.g. base moved during the merge — a benign TOCTOU race) is retried up to MERGE_RETRY_CAP and then
-// escalated to the same terminal hold. Either way the planner suppresses the merge for this head SHA and the PR
-// is held for a human (never auto-closed).
+// RC3: persist only TERMINAL failed-merge outcomes. Auth/policy/conflict failures are terminal immediately; a
+// generic GitHub 403 is not, because it also covers branch-protection/check/conversation convergence after the
+// bot publishes its own review/check. Retry those up to MERGE_RETRY_CAP before holding the PR for a human.
 async function handleMergeFailure(env: Env, ctx: AgentActionExecutionContext, error: unknown): Promise<void> {
   const headSha = ctx.headSha;
   /* v8 ignore next -- guarded at the call site; defensive. */

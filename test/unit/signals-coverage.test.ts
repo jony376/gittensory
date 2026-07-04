@@ -282,6 +282,29 @@ describe("signal coverage edge cases", () => {
     });
   });
 
+  it("recognizes GitHub's fully-qualified owner/repo#N closing reference, repo-scoped", () => {
+    const directRepo = repo("owner/direct");
+    const linkedIssuesFor = (body: string) =>
+      buildPreflightResult({ repoFullName: directRepo.fullName, title: "Fix cache invalidation", body }, directRepo, [issue(directRepo.fullName, 42, "Cache invalidation")], []);
+
+    // Same-repo fully-qualified closing ref (GitHub's documented `KEYWORD owner/repo#N` form) links issue 42.
+    const qualified = linkedIssuesFor("Fixes owner/direct#42");
+    expect(qualified.linkedIssues).toContain(42);
+    expect(qualified.findings.map((f) => f.code)).not.toContain("missing_linked_issue");
+
+    // …case-insensitively on owner/repo.
+    expect(linkedIssuesFor("Resolves Owner/Direct#42").linkedIssues).toContain(42);
+
+    // A cross-repo reference closes an issue elsewhere and must NOT spoof a same-repo link.
+    const crossRepo = linkedIssuesFor("Fixes other-org/other#42");
+    expect(crossRepo.linkedIssues).not.toContain(42);
+    expect(crossRepo.findings.map((f) => f.code)).toContain("missing_linked_issue");
+
+    // The bare `#N` form and word-boundary guard (#1988) are unchanged: `unfixes` is not a keyword.
+    expect(linkedIssuesFor("Closes #42").linkedIssues).toContain(42);
+    expect(linkedIssuesFor("unfixes owner/direct#42").linkedIssues).not.toContain(42);
+  });
+
   it("covers issue quality, burden, bounties, noise, and reviewability edge decisions", () => {
     const directRepo = repo("owner/direct");
     const issueRepo = repo("owner/issues", { issueDiscoveryShare: 1 });
@@ -1066,7 +1089,7 @@ describe("signal coverage edge cases", () => {
       collisions: buildCollisionReport(directRepo.fullName, [], [currentPr]),
       preflight: buildPreflightResult({ repoFullName: directRepo.fullName, title: "Fix isolated issue", body: "Fixes #99", linkedIssues: [99] }, directRepo, [], [currentPr]),
       settings: gateSettings,
-      review: { present: true, footerText: "Reviewed by the Acme maintainer bot.", note: "Run npm test before pushing.", fields: { relatedWork: false }, profile: null, securityFocus: null, inlineComments: null, pathInstructions: [], instructions: null, excludePaths: [], preMergeChecks: [] },
+      review: { present: true, footerText: "Reviewed by the Acme maintainer bot.", note: "Run npm test before pushing.", fields: { relatedWork: false }, enrichmentAnalyzers: {}, profile: null, securityFocus: null, inlineComments: null, pathInstructions: [], instructions: null, excludePaths: [], preMergeChecks: [] },
       aiReview: { notes: "The change is focused.\n\n**Nits (2)**\n- Add a test for the </details> edge case.\n- Keep the validator helper scoped." },
     });
     expect(customizedComment).toContain("Reviewed by the Acme maintainer bot."); // custom footer lead

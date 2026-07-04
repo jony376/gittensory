@@ -43,6 +43,7 @@ import { createInstallationToken } from "../../src/github/app";
 import { fetchLiveCiAggregate, refreshInstallationHealthForInstallation } from "../../src/github/backfill";
 import {
   actionParams,
+  clearInstallationHealthRefreshCooldownForTest,
   clearWritePermissionDenialCooldownForTest,
   executeAgentMaintenanceActions,
   executeIssueMaintenanceActions,
@@ -69,7 +70,7 @@ function ctx(over: Partial<AgentActionExecutionContext> = {}): AgentActionExecut
     autonomy: { label: "auto", request_changes: "auto", approve: "auto", merge: "auto", close: "auto", update_branch: "auto" },
     agentPaused: false,
     agentDryRun: false,
-    installationPermissions: { pull_requests: "write", issues: "write" },
+    installationPermissions: { pull_requests: "write", contents: "write", issues: "write" },
     ...over,
   };
 }
@@ -93,6 +94,7 @@ describe("executeAgentMaintenanceActions (#778 gate stack)", () => {
       liveHeadSha: args.expectedHeadSha ?? null,
       liveState: "open",
     }));
+    clearInstallationHealthRefreshCooldownForTest();
     clearWritePermissionDenialCooldownForTest();
     resetMetrics();
   });
@@ -309,7 +311,7 @@ describe("executeAgentMaintenanceActions (#778 gate stack)", () => {
   it("LIVE merge is denied when live CI has since turned failing (#2128)", async () => {
     const env = createTestEnv({});
     vi.mocked(fetchLiveCiAggregate).mockResolvedValueOnce({ ciState: "failed", hasPending: false, hasVisiblePending: false, failingDetails: [], nonRequiredFailingDetails: [], ciCompletenessWarning: null });
-    const outcomes = await executeAgentMaintenanceActions(env, ctx(), [merge]);
+    const outcomes = await executeAgentMaintenanceActions(env, ctx({ installationId: 127 }), [merge]);
     expect(outcomes[0]?.outcome).toBe("denied");
     expect(outcomes[0]?.detail).toContain("live CI is no longer passing (now: failed)");
     expect(mergePullRequest).not.toHaveBeenCalled();
@@ -443,16 +445,23 @@ describe("executeAgentMaintenanceActions (#778 gate stack)", () => {
     expect(JSON.parse((await auditFor(env, "merge"))?.metadata_json ?? "{}")).toMatchObject({ autonomyLevel: "observe" });
   });
 
-  it("PR-write without pull_requests:write → denied (re-consent), but label still runs (issues:write)", async () => {
+  it("pull-request writes without pull_requests:write are denied, but label and merge use their own permissions", async () => {
     const env = createTestEnv({});
-    const outcomes = await executeAgentMaintenanceActions(env, ctx({ installationPermissions: { pull_requests: "read", issues: "write" } }), [label, merge, updateBranch]);
+    const outcomes = await executeAgentMaintenanceActions(env, ctx({ installationPermissions: { pull_requests: "read", contents: "write", issues: "write" } }), [label, merge, updateBranch]);
     expect(outcomes.find((o) => o.actionClass === "label")?.outcome).toBe("completed");
-    expect(outcomes.find((o) => o.actionClass === "merge")?.outcome).toBe("denied");
+    expect(outcomes.find((o) => o.actionClass === "merge")?.outcome).toBe("completed");
     expect(outcomes.find((o) => o.actionClass === "update_branch")?.outcome).toBe("denied");
     expect(ensurePullRequestLabel).toHaveBeenCalledTimes(1);
-    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(mergePullRequest).toHaveBeenCalledTimes(1);
     expect(updatePullRequestBranch).not.toHaveBeenCalled();
-    expect((await auditFor(env, "merge"))?.outcome).toBe("denied");
+    expect((await auditFor(env, "update_branch"))?.outcome).toBe("denied");
+  });
+
+  it("REGRESSION: merge without contents:write is denied before any GitHub mutation", async () => {
+    const env = createTestEnv({});
+    const outcomes = await executeAgentMaintenanceActions(env, ctx({ installationPermissions: { pull_requests: "write", contents: "read", issues: "write" } }), [merge]);
+    expect(outcomes[0]).toMatchObject({ actionClass: "merge", outcome: "denied", detail: "contents: write not granted — maintainer must re-consent" });
+    expect(mergePullRequest).not.toHaveBeenCalled();
   });
 
   describe("write-permission denial cooldown (#selfhost-runtime-drift)", () => {
@@ -463,12 +472,12 @@ describe("executeAgentMaintenanceActions (#778 gate stack)", () => {
       return Number(row?.c ?? 0);
     }
 
-    it("suppresses a repeated pull_requests:write denial within the cooldown window — still denied, but not re-audited", async () => {
+    it("suppresses a repeated write-permission denial within the cooldown window — still denied, but not re-audited", async () => {
       const env = createTestEnv({});
-      const deniedCtx = ctx({ installationId: 200, installationPermissions: { pull_requests: "read", issues: "write" } });
+      const deniedCtx = ctx({ installationId: 200, installationPermissions: { pull_requests: "write", contents: "read", issues: "write" } });
 
       const first = await executeAgentMaintenanceActions(env, deniedCtx, [merge]);
-      expect(first[0]).toMatchObject({ outcome: "denied", detail: "pull_requests: write not granted — maintainer must re-consent" });
+      expect(first[0]).toMatchObject({ outcome: "denied", detail: "contents: write not granted — maintainer must re-consent" });
       expect(await auditCount(env, "merge")).toBe(1);
 
       const second = await executeAgentMaintenanceActions(env, deniedCtx, [merge]);
@@ -484,7 +493,7 @@ describe("executeAgentMaintenanceActions (#778 gate stack)", () => {
 
     it("resumes loud auditing once the cooldown window elapses", async () => {
       const env = createTestEnv({});
-      const deniedCtx = ctx({ installationId: 201, installationPermissions: { pull_requests: "read", issues: "write" } });
+      const deniedCtx = ctx({ installationId: 201, installationPermissions: { pull_requests: "write", contents: "read", issues: "write" } });
       vi.useFakeTimers();
       vi.setSystemTime(new Date("2026-07-03T00:00:00Z"));
       try {
@@ -497,7 +506,7 @@ describe("executeAgentMaintenanceActions (#778 gate stack)", () => {
 
         vi.setSystemTime(new Date("2026-07-03T00:15:01Z")); // cooldown elapsed
         const afterCooldown = await executeAgentMaintenanceActions(env, deniedCtx, [merge]);
-        expect(afterCooldown[0]?.detail).toBe("pull_requests: write not granted — maintainer must re-consent");
+        expect(afterCooldown[0]?.detail).toBe("contents: write not granted — maintainer must re-consent");
         expect(await auditCount(env, "merge")).toBe(2);
       } finally {
         vi.useRealTimers();
@@ -506,7 +515,7 @@ describe("executeAgentMaintenanceActions (#778 gate stack)", () => {
 
     it("scopes the cooldown per installation/repo/action-class — a different action class is not suppressed by another's denial", async () => {
       const env = createTestEnv({});
-      const deniedCtx = ctx({ installationId: 202, installationPermissions: { pull_requests: "read", issues: "write" } });
+      const deniedCtx = ctx({ installationId: 202, installationPermissions: { pull_requests: "read", contents: "read", issues: "write" } });
 
       await executeAgentMaintenanceActions(env, deniedCtx, [merge]);
       const closeOutcome = await executeAgentMaintenanceActions(env, deniedCtx, [close]);
@@ -517,17 +526,17 @@ describe("executeAgentMaintenanceActions (#778 gate stack)", () => {
 
     it("scopes the cooldown per repo — the SAME installation denied on a different repo is not suppressed", async () => {
       const env = createTestEnv({});
-      const perms = { pull_requests: "read" as const, issues: "write" as const };
+      const perms = { pull_requests: "write" as const, contents: "read" as const, issues: "write" as const };
       await executeAgentMaintenanceActions(env, ctx({ installationId: 203, repoFullName: "owner/repo-a", installationPermissions: perms }), [merge]);
       const otherRepo = await executeAgentMaintenanceActions(env, ctx({ installationId: 203, repoFullName: "owner/repo-b", installationPermissions: perms }), [merge]);
 
-      expect(otherRepo[0]?.detail).toBe("pull_requests: write not granted — maintainer must re-consent");
+      expect(otherRepo[0]?.detail).toBe("contents: write not granted — maintainer must re-consent");
       expect(await auditCount(env, "merge")).toBe(2); // one audit row per repo
     });
 
     it("REGRESSION (gate finding): a transient audit-write failure on the FIRST denial does not arm the cooldown — the retry attempts the audit again instead of being silently suppressed", async () => {
       const env = createTestEnv({});
-      const deniedCtx = ctx({ installationId: 204, installationPermissions: { pull_requests: "read", issues: "write" } });
+      const deniedCtx = ctx({ installationId: 204, installationPermissions: { pull_requests: "write", contents: "read", issues: "write" } });
       const auditSpy = vi.spyOn(repositoriesModule, "recordAuditEvent").mockRejectedValueOnce(new Error("D1 write error"));
 
       await expect(executeAgentMaintenanceActions(env, deniedCtx, [merge])).rejects.toThrow("D1 write error");
@@ -537,21 +546,21 @@ describe("executeAgentMaintenanceActions (#778 gate stack)", () => {
       const retry = await executeAgentMaintenanceActions(env, deniedCtx, [merge]);
 
       // Loud, not suppressed — the cooldown was never armed by the failed first attempt.
-      expect(retry[0]?.detail).toBe("pull_requests: write not granted — maintainer must re-consent");
+      expect(retry[0]?.detail).toBe("contents: write not granted — maintainer must re-consent");
       expect(await auditCount(env, "merge")).toBe(1);
     });
 
     it("REGRESSION (gate finding): scopes the cooldown per PR — a denial on a DIFFERENT PR in the same installation/repo/action-class is not suppressed", async () => {
       const env = createTestEnv({});
-      const perms = { pull_requests: "read" as const, issues: "write" as const };
+      const perms = { pull_requests: "write" as const, contents: "read" as const, issues: "write" as const };
 
       const prA = await executeAgentMaintenanceActions(env, ctx({ installationId: 205, pullNumber: 501, installationPermissions: perms }), [merge]);
       const prB = await executeAgentMaintenanceActions(env, ctx({ installationId: 205, pullNumber: 502, installationPermissions: perms }), [merge]);
 
       // Both denials are loud — PR B's cooldown key differs from PR A's, so it must never be silently
       // suppressed by PR A's already-armed cooldown within the same 15m window.
-      expect(prA[0]).toMatchObject({ outcome: "denied", detail: "pull_requests: write not granted — maintainer must re-consent" });
-      expect(prB[0]).toMatchObject({ outcome: "denied", detail: "pull_requests: write not granted — maintainer must re-consent" });
+      expect(prA[0]).toMatchObject({ outcome: "denied", detail: "contents: write not granted — maintainer must re-consent" });
+      expect(prB[0]).toMatchObject({ outcome: "denied", detail: "contents: write not granted — maintainer must re-consent" });
       expect(await auditCount(env, "merge")).toBe(2); // one audit row per PR, not one shared row
     });
   });
@@ -721,6 +730,26 @@ describe("executeAgentMaintenanceActions (#778 gate stack)", () => {
     expect(outcomes[0]?.outcome).toBe("error");
     expect(outcomes[0]?.detail).toMatch(/not mergeable/i);
     expect((await auditFor(env, "merge"))?.outcome).toBe("error");
+  });
+
+  it("REGRESSION: a generic GitHub 403 merge rejection does not immediately pin merge_blocked_sha", async () => {
+    const env = createTestEnv({});
+    await upsertPullRequestFromGitHub(env, "owner/repo", { number: 7, title: "PR", state: "open", user: { login: "c" }, head: { sha: "sha7" }, labels: [], body: "" });
+    vi.mocked(mergePullRequest).mockRejectedValueOnce(Object.assign(new Error("Resource not accessible by integration"), { status: 403 }));
+
+    const outcomes = await executeAgentMaintenanceActions(env, ctx(), [merge]);
+
+    expect(outcomes[0]).toMatchObject({ actionClass: "merge", outcome: "error" });
+    const row = await env.DB.prepare(
+      "select merge_attempt_count as mergeAttemptCount, merge_blocked_sha as mergeBlockedSha, merge_blocked_reason as mergeBlockedReason from pull_requests where repo_full_name = ? and number = ?",
+    )
+      .bind("owner/repo", 7)
+      .first<{ mergeAttemptCount: number; mergeBlockedSha: string | null; mergeBlockedReason: string | null }>();
+    expect(row).toEqual({ mergeAttemptCount: 1, mergeBlockedSha: null, mergeBlockedReason: null });
+    const blocked = await env.DB.prepare("select count(*) as count from audit_events where event_type = ?")
+      .bind("agent.action.merge_blocked")
+      .first<{ count: number }>();
+    expect(blocked?.count).toBe(0);
   });
 
   it("opportunistically refreshes installation health when a PR-write mutation fails with a 403 (#2265)", async () => {

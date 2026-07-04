@@ -170,13 +170,13 @@ describe("manage status snapshot (#2325)", () => {
   });
 });
 
-describe("gittensory-miner status CLI (#2325)", () => {
+describe("gittensory-miner manage status CLI (#2325)", () => {
   it("prints the empty-portfolio message from the bin entrypoint", () => {
     const root = mkdtempSync(join(tmpdir(), "gittensory-miner-status-cli-"));
     roots.push(root);
     vi.stubEnv("GITTENSORY_MINER_CONFIG_DIR", root);
     vi.stubEnv("GITTENSORY_MINER_NO_UPDATE_CHECK", "1");
-    const output = runCapture(["status", "--no-update-check"]);
+    const output = runCapture(["manage", "status", "--no-update-check"]);
     expect(output).toContain("No managed pull requests");
   });
 
@@ -185,13 +185,13 @@ describe("gittensory-miner status CLI (#2325)", () => {
     roots.push(root);
     vi.stubEnv("GITTENSORY_MINER_CONFIG_DIR", root);
     vi.stubEnv("GITTENSORY_MINER_NO_UPDATE_CHECK", "1");
-    const output = runCapture(["status", "--json", "--no-update-check"]);
+    const output = runCapture(["manage", "status", "--json", "--no-update-check"]);
     expect(JSON.parse(output)).toEqual({ rows: [] });
   });
 
-  it("includes status in help output", () => {
+  it("includes manage status in help output", () => {
     const output = runCapture(["--help", "--no-update-check"]);
-    expect(output).toContain("gittensory-miner status");
+    expect(output).toContain("gittensory-miner manage status");
     expect(output).toContain("--json");
   });
 });

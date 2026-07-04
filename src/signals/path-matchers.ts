@@ -50,10 +50,17 @@ function isGeneratedFileFrom(parts: NormalizedPath): boolean {
   return (
     /(^|\/)(__generated__|generated)\//.test(norm) ||
     /\.(generated|gen)\.[^/]+$/.test(norm) ||
-    /\.pb\.(go|ts|js)$/.test(norm) ||
-    /_pb2\.pyi?$/.test(norm) ||
+    // protoc output: Go/TS/JS plugins emit `.pb.{go,ts,js}`, and the reference C++ plugin
+    // emits `.pb.cc` / `.pb.h` (the `.pb` infix keeps a hand-written `.h`/`.cc` from matching).
+    /\.pb\.(go|ts|js|cc|h)$/.test(norm) ||
+    // Python protobuf: message stubs are `*_pb2.py[i]`; the gRPC plugin emits sibling
+    // `*_pb2_grpc.py[i]` service stubs, which are the same machine-generated output.
+    /_pb2(_grpc)?\.pyi?$/.test(norm) ||
     /\.g\.dart$/.test(norm) ||
-    /\.(js|jsx|ts|tsx|css)\.map$/.test(norm) ||
+    // Source maps for every first-class JS/TS bundle extension. `.mjs`/`.cjs` are already
+    // recognized code extensions (isCodeFile), so their bundlers' `.mjs.map` / `.cjs.map`
+    // maps are generated output too — the same as `.js.map`.
+    /\.(js|jsx|mjs|cjs|ts|tsx|css)\.map$/.test(norm) ||
     base === "worker-configuration.d.ts"
   );
 }
@@ -143,6 +150,19 @@ const DEPENDENCY_MANIFEST_NAMES: ReadonlySet<string> = new Set([
   // manifests they resolve belong in the same dependency-manifest category.
   "package.swift",
   "podfile",
+  // Conan (C/C++) manifests — conan.lock is already recognized above, so the
+  // manifests it resolves belong here for the same reason as the Swift/CocoaPods
+  // pair. Conan accepts either the classic .txt or the Python-based recipe.
+  "conanfile.txt",
+  "conanfile.py",
+  // sbt (Scala/JVM) build definition — the JVM ecosystem is already represented
+  // by build.gradle(.kts) and pom.xml; build.sbt is sbt's dependency manifest.
+  "build.sbt",
+  // setuptools (Python) manifests — the Python ecosystem is already represented
+  // by requirements.txt/pyproject.toml/pipfile; setup.py/setup.cfg are the
+  // classic setuptools packaging manifests.
+  "setup.py",
+  "setup.cfg",
 ]);
 
 const DOCS_EXTENSIONS: ReadonlySet<string> = new Set(["md", "mdx", "markdown", "rst", "adoc", "asciidoc"]);

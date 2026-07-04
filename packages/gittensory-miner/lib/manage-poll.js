@@ -146,7 +146,7 @@ export async function recordManagePollSnapshot(input, options = {}) {
     lastPolledAt: options.lastPolledAt,
   });
 
-  if (options.ensurePortfolioRow && portfolioQueue) {
+  if ((options.ensurePortfolioRow ?? true) && portfolioQueue) {
     ensureManagedPrRow(portfolioQueue, repoFullName, input.prNumber);
   }
 

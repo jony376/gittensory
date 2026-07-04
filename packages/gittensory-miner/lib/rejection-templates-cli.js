@@ -13,7 +13,7 @@ function parseJsonFlag(args) {
       options.json = true;
       continue;
     }
-    if (token.startsWith("-")) {
+    if (token.startsWith("--")) {
       return { error: `Unknown option: ${token}` };
     }
     positional.push(token);
@@ -31,7 +31,7 @@ export function parseRejectionListArgs(args) {
       options.json = true;
       continue;
     }
-    if (token.startsWith("-")) return { error: `Unknown option: ${token}` };
+    if (token.startsWith("--")) return { error: `Unknown option: ${token}` };
     positional.push(token);
   }
 

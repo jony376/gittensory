@@ -10,6 +10,7 @@ import {
   parseManagedPrIdentifier,
   renderManageStatusTable,
   runManageStatus,
+  type ManageStatusRow,
 } from "../../packages/gittensory-miner/lib/manage-status.js";
 import {
   closeDefaultEventLedger,
@@ -132,7 +133,7 @@ describe("gittensory-miner manage status (#2325)", () => {
   });
 
   it("renders numeric queue priority in the table output", () => {
-    const rows = [
+    const rows: ManageStatusRow[] = [
       {
         repoFullName: "acme/widgets",
         prNumber: 4,

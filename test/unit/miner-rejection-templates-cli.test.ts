@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RejectionReason } from "../../packages/gittensory-miner/lib/rejection-templates.d.ts";
 import {
   parseRejectionListArgs,
@@ -8,6 +8,10 @@ import {
   runRejectionList,
   runRejectionRender,
 } from "../../packages/gittensory-miner/lib/rejection-templates-cli.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("gittensory-miner rejection templates CLI (#2324)", () => {
   it("parseRejectionListArgs and parseRejectionRenderArgs validate argv", () => {
@@ -69,6 +73,10 @@ describe("gittensory-miner rejection templates CLI (#2324)", () => {
   it("runRejectionRender fails closed on malformed render context", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     expect(runRejectionRender(["gate_close", "owner/repo/extra", "1"])).toBe(2);
+    expect(error).toHaveBeenCalledWith("Repository must be in owner/repo form.");
+
+    error.mockClear();
+    expect(runRejectionRender(["gate_close", "-owner/repo", "1"])).toBe(2);
     expect(error).toHaveBeenCalledWith("invalid_repo_full_name");
   });
 

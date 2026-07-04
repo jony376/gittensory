@@ -122,6 +122,29 @@ describe("gittensory-miner plan store (#2318)", () => {
     ).toThrow("invalid_plan");
   });
 
+  it("rejects cyclic dependsOn graphs on save", () => {
+    const store = tempStore();
+    const step = (id: string, dependsOn: string[]) => ({
+      id,
+      title: id,
+      dependsOn,
+      status: "pending" as const,
+      attempts: 0,
+      maxAttempts: 1,
+    });
+
+    expect(() =>
+      store.savePlan("two-cycle", {
+        steps: [step("a", ["b"]), step("b", ["a"])],
+      }),
+    ).toThrow("invalid_plan");
+    expect(() =>
+      store.savePlan("three-cycle", {
+        steps: [step("a", ["c"]), step("b", ["a"]), step("c", ["b"])],
+      }),
+    ).toThrow("invalid_plan");
+  });
+
   it("rejects a corrupted plan blob on load instead of returning a malformed plan", () => {
     const store = tempStore();
     store.savePlan("p1", PLAN);

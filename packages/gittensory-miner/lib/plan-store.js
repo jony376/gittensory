@@ -95,6 +95,23 @@ function validatePlanDag(plan) {
       if (dep === step.id || !seenStepIds.has(dep)) throw new Error("invalid_plan");
     }
   }
+  const color = new Map();
+  const byId = new Map(plan.steps.map((step) => [step.id, step]));
+  const hasCycle = (id) => {
+    color.set(id, 1);
+    for (const dep of byId.get(id)?.dependsOn ?? []) {
+      const depColor = color.get(dep) ?? 0;
+      if (depColor === 1) return true;
+      if (depColor === 0 && byId.has(dep) && hasCycle(dep)) return true;
+    }
+    color.set(id, 2);
+    return false;
+  };
+  for (const step of plan.steps) {
+    if ((color.get(step.id) ?? 0) === 0 && hasCycle(step.id)) {
+      throw new Error("invalid_plan");
+    }
+  }
   return plan;
 }
 

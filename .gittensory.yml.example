@@ -312,19 +312,47 @@ gate:
 # deterministic gate policy above. Omit the block to keep the byte-identical
 # defaults.
 review:
-  # Skip AI/public review output for matching PR author logins. Useful for dependency
-  # bump or release automation that already has separate policy/CI. This is a quiet
-  # skip, not a gate failure: when the Orb review check is enabled it is completed as
-  # "skipped" with an ignored-author reason.
+  # Deterministic AI review eligibility filters (`review.auto_review`, #1954 / #2038–#2041). Each knob quietly
+  # skips the advisory AI review for matching PRs — never a gate failure. When the Orb review check is enabled,
+  # skipped PRs complete as "skipped" with a human-readable reason (see `evaluateAutoReviewSkipReason` in
+  # `src/signals/focus-manifest.ts` and the public-surface `SKIP_SUMMARY.ignored_author` mapping in
+  # `src/signals/settings-preview.ts`).
   #
-  # Glob list. `*` and `**` both match any run of characters; `**/name` also matches
-  # `name` at the root. Matching is case-insensitive against the GitHub login.
-  # Default: [] (every author remains review-eligible).
+  # Invariant: every field below defaults to off/empty/null, which is byte-identical to today's behavior — every
+  # PR is reviewed exactly as before. Skips are quiet and never block merge on their own.
   auto_review:
+    # Bool | null. Default: null (draft PRs are reviewed as today). When true, draft PRs skip AI review.
+    # skip_drafts: true
+
+    # Glob list of PR author logins whose PRs skip AI review. Useful for dependency bump or release automation
+    # that already has separate policy/CI. `*` and `**` match any run; matching is case-insensitive.
+    # Default: [] (every author remains review-eligible).
     ignore_authors:
       - "*[bot]"
       - dependabot
       - renovate
+
+    # Case-insensitive title substrings that skip AI review (e.g. WIP/DRAFT markers). Default: [].
+    # ignore_title_keywords:
+    #   - WIP
+    #   - DRAFT
+
+    # Base-ref globs whose PRs ARE reviewed. When non-empty, PRs targeting other bases skip review.
+    # Default: [] (every base branch is in scope).
+    # base_branches:
+    #   - main
+    #   - release/**
+
+    # Non-negative integer. After N published AI reviews on this PR, pause further re-reviews.
+    # Default: null / 0 (re-review every sync, byte-identical).
+    # auto_pause_after_reviewed_commits: 3
+
+  # Planned eligibility knobs (tracked separately — not parsed yet; omit until shipped):
+  #   skip_labels, skip_docs_only, max_added_lines, max_files (#2062–#2065).
+
+  # Planned display toggle (#2069): when enabled, the unified review comment includes a
+  # `review effort: N/5 (~M min)` line derived from the per-PR effort estimate.
+  # effort_score: false
 
   # Deterministic label suggestions (#2045). Each rule SUGGESTS a non-scoring label when a PR matches ALL of the
   # `when` criteria it sets (at least one is required): when_paths (any changed path matches a glob), title_contains,
@@ -611,7 +639,8 @@ settings:
 #     - "!src/generated/**"
 #   # Public-safe voice brief complementing review.profile (e.g. concise, cite line numbers). null/unset ⇒ byte-identical prompt.
 #   tone: "Be concise and cite line numbers."
-#   # Deterministic AI review eligibility filters — skipped PRs never fail the gate. (#1954)
+#   # See the active `review.auto_review` block above for the full eligibility reference (defaults, types, examples).
+#   # The commented snapshot below mirrors a typical self-host setup:
 #   auto_review:
 #     skip_drafts: true
 #     ignore_authors:
@@ -622,7 +651,7 @@ settings:
 #     base_branches:
 #       - main
 #       - release/**
-#     auto_pause_after_reviewed_commits: 3  # after 3 published AI reviews on this PR, pause further re-reviews (0/unset = off)
+#     auto_pause_after_reviewed_commits: 3
 
 # Per-repo activation overrides for the converged review features that ship behind a deployment-wide
 # GITTENSORY_REVIEW_* env kill-switch (rag/reputation/unifiedComment/safety). Each key is `true` (force on

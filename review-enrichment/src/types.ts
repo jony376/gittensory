@@ -360,6 +360,16 @@ export interface UndocumentedExportFinding {
   symbol: string;
 }
 
+/** A newly-added enum/union member whose sibling cases are handled in a switch but the new member is not — a likely
+ *  exhaustiveness miss. (#2028) */
+export interface ExhaustivenessFinding {
+  file: string;
+  line: number;
+  unionName: string;
+  addedMember: string;
+  consumerFile?: string;
+}
+
 /** A review/approval integrity signal, read from structured PR-reviews API fields only (state, commit_id,
  *  user.login, submitted_at) — never diff/file content. `stale-approval`: the reviewer's latest APPROVED review
  *  predates the PR's current head commit. `self-approval`: the PR author approved their own PR.
@@ -587,6 +597,7 @@ export interface BriefFindings {
   nativeBuild?: NativeBuildFinding[];
   history?: HistoryFinding[];
   docCommentDrift?: DocCommentDriftFinding[];
+  exhaustiveness?: ExhaustivenessFinding[];
   duplication?: DuplicationFinding[];
   churnHotspot?: ChurnHotspotFinding[];
   blameLink?: BlameLinkFinding[];

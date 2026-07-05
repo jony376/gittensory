@@ -635,6 +635,34 @@
       }
     },
     {
+      "name": "exhaustiveness",
+      "title": "Enum/union exhaustiveness drift",
+      "category": "quality",
+      "cost": "github-light",
+      "defaultEnabled": true,
+      "profiles": [
+        "balanced",
+        "deep"
+      ],
+      "requires": [
+        "files",
+        "github-token",
+        "head-sha"
+      ],
+      "limits": {
+        "maxFiles": 12,
+        "maxFetches": 20,
+        "maxFindings": 25
+      },
+      "docs": {
+        "summary": "Flags when a PR adds a new enum or string-literal union member but a switch in the changed set still omits it while handling siblings.",
+        "looksAt": "Added enum/union members from the diff, the type definition fetched at headSha, and switch statements in other changed source files.",
+        "reports": "Type file, line, union name, added member, and the consumer file with the incomplete switch.",
+        "network": "Bounded GitHub contents fetches for changed source files at headSha. Requires token forwarding for private repos.",
+        "notes": "Conservative: reports only when a switch covers at least two sibling members but not the new one; fetch errors skip that symbol."
+      }
+    },
+    {
       "name": "duplication",
       "title": "Near-verbatim duplicated code",
       "category": "quality",

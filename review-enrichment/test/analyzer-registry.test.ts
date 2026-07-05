@@ -31,6 +31,7 @@ const EXPECTED_ANALYZERS = [
   "nativeBuild",
   "history",
   "docCommentDrift",
+  "exhaustiveness",
   "duplication",
   "churnHotspot",
   "blameLink",

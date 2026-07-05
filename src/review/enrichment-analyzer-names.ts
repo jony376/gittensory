@@ -25,6 +25,7 @@ export const REES_ANALYZER_NAMES = [
   "nativeBuild",
   "history",
   "docCommentDrift",
+  "exhaustiveness",
   "duplication",
   "churnHotspot",
   "blameLink",

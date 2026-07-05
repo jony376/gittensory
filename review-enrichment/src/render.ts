@@ -445,6 +445,8 @@ export function renderBrief(
     }
   }
 
+  lines.push(...renderDescriptorSection("exhaustiveness", findings.exhaustiveness));
+
   const duplication = findings.duplication ?? [];
   if (duplication.length) {
     lines.push(

@@ -10,6 +10,7 @@ import { scanCommitSignature } from "./commit-signature.js";
 import { dependencyAnalyzer } from "./dependency/descriptor.js";
 import { scanDependencyDiffInventory } from "./dependency-diff.js";
 import { scanDocCommentDrift } from "./doc-comment-drift.js";
+import { scanExhaustivenessDrift } from "./exhaustiveness-drift.js";
 import { scanDuplication } from "./duplication-scan.js";
 import { scanEol } from "./eol-check.js";
 import { scanHardcodedUrl } from "./hardcoded-url.js";
@@ -479,6 +480,40 @@ export const ANALYZER_DESCRIPTORS = [
         "Conservative: only named function declarations with confidently-enumerable params; non-parameter signature edits are not reported.",
     },
     run: (req, { signal }) => scanDocCommentDrift(req, fetch, { signal }),
+  }),
+  descriptor({
+    name: "exhaustiveness",
+    title: "Enum/union exhaustiveness drift",
+    category: "quality",
+    cost: "github-light",
+    defaultEnabled: true,
+    requires: ["files", "github-token", "head-sha"],
+    limits: { maxFiles: 12, maxFetches: 20, maxFindings: 25 },
+    docs: {
+      summary:
+        "Flags when a PR adds a new enum or string-literal union member but a switch in the changed set still omits it while handling siblings.",
+      looksAt:
+        "Added enum/union members from the diff, the type definition fetched at headSha, and switch statements in other changed source files.",
+      reports: "Type file, line, union name, added member, and the consumer file with the incomplete switch.",
+      network:
+        "Bounded GitHub contents fetches for changed source files at headSha. Requires token forwarding for private repos.",
+      notes:
+        "Conservative: reports only when a switch covers at least two sibling members but not the new one; fetch errors skip that symbol.",
+    },
+    render: (findings, helpers) => {
+      if (!findings.length) return [];
+      const lines = ["### Enum/union exhaustiveness drift (switch missing a new member)"];
+      for (const item of findings) {
+        const where = item.consumerFile
+          ? ` — switch in ${helpers.safeCodeSpan(item.consumerFile)}`
+          : "";
+        lines.push(
+          `- ${helpers.safeCodeSpan(`${item.file}:${item.line}`)} adds ${helpers.safeCodeSpan(item.addedMember)} to ${helpers.safeCodeSpan(item.unionName)}${where}`,
+        );
+      }
+      return lines;
+    },
+    run: (req, { signal }) => scanExhaustivenessDrift(req, fetch, { signal }),
   }),
   descriptor({
     name: "duplication",

@@ -11,7 +11,7 @@ const MAX_FILES = 20;
 const MAX_FINDINGS = 50;
 const MAX_SIGNATURE_LINES = 40;
 const MAX_FETCH_BYTES = 1_000_000;
-const SOURCE_RE = /\.(?:ts|tsx|js|jsx|mjs|cjs)$/;
+const SOURCE_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 const SKIP_RE = /(?:\.d\.ts$|\.min\.|\.test\.|\.spec\.|__tests__\/|(?:^|\/)tests?\/)/;
 const SLUG_RE = /^[A-Za-z0-9._-]+$/;
 // Matches a named `function` declaration up to its parameter `(`. A single, non-nested generic clause is allowed;

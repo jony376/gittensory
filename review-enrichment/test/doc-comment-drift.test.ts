@@ -234,6 +234,17 @@ test("scanDocCommentDrift: fetches the file at headSha and reports drift", async
   assert.deepEqual(findings[0].staleParams, ["oldName"]);
 });
 
+test("scanDocCommentDrift: analyzes TypeScript .mts/.cts module files too", async () => {
+  // SOURCE_RE includes the .mjs/.cjs siblings, so their TypeScript counterparts must
+  // be scanned as well or drift in .mts/.cts files is silently missed.
+  for (const path of ["src/a.mts", "src/a.cts"]) {
+    const findings = await scanDocCommentDrift(baseReq([{ path, patch: DRIFT_PATCH }]), fileWith(DRIFTED));
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].file, path);
+    assert.deepEqual(findings[0].staleParams, ["oldName"]);
+  }
+});
+
 test("scanDocCommentDrift: skips oversized file responses before reading the body", async () => {
   let bodyAccessed = false;
   const out = await scanDocCommentDrift(

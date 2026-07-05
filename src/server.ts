@@ -51,7 +51,7 @@ import {
   sqliteBackupAdvisory,
   type ReadinessProbe,
 } from "./selfhost/health";
-import { gauge, gaugeVector, incr, observe, renderMetrics, setSelfHostedMetricsMode } from "./selfhost/metrics";
+import { counterValue, gauge, gaugeVector, hitRatio, incr, observe, renderMetrics, setSelfHostedMetricsMode } from "./selfhost/metrics";
 import { runSelfHostMigrations } from "./selfhost/migrate";
 import { createPgAdapter, tuneGithubRateLimitObservationsAutovacuum } from "./selfhost/pg-adapter";
 import { createPgQueue } from "./selfhost/pg-queue";
@@ -691,6 +691,12 @@ async function main(): Promise<void> {
     Math.floor((Date.now() - startedAt) / 1000),
   );
   gauge("gittensory_backup_acknowledged", () => backupAcknowledgedGaugeValue(sqliteBackupOpts));
+  gauge("gittensory_redis_gh_response_cache_hit_ratio", () =>
+    hitRatio(
+      counterValue("gittensory_redis_gh_response_cache_total", { result: "hit" }),
+      counterValue("gittensory_redis_gh_response_cache_total", { result: "miss" }),
+    ),
+  );
   // Pre-initialize job counters to 0 so they appear in the first Prometheus scrape (lazy counters
   // created on first use would otherwise cause "No data" in Grafana until the first job event).
   for (const c of [

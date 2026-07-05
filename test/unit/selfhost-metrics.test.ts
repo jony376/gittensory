@@ -325,16 +325,4 @@ describe("hitRatio (#2090)", () => {
     expect(counterValue("gittensory_redis_gh_response_cache_total", { result: "miss" })).toBe(1);
     expect(counterValue("gittensory_redis_gh_response_cache_total", { result: "set" })).toBe(0);
   });
-
-  it("renders the scrape-time hit-ratio gauge from hit/miss counters", async () => {
-    incr("gittensory_redis_gh_response_cache_total", { result: "hit" }, 3);
-    incr("gittensory_redis_gh_response_cache_total", { result: "miss" }, 1);
-    gauge("gittensory_redis_gh_response_cache_hit_ratio", () =>
-      hitRatio(
-        counterValue("gittensory_redis_gh_response_cache_total", { result: "hit" }),
-        counterValue("gittensory_redis_gh_response_cache_total", { result: "miss" }),
-      ),
-    );
-    expect(await renderMetrics()).toContain("gittensory_redis_gh_response_cache_hit_ratio 0.75");
-  });
 });

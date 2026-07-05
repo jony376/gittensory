@@ -210,6 +210,31 @@ describe("review.auto_review wiring (#1954)", () => {
     auditSpy.mockRestore();
   });
 
+  it("resolveAutoReviewSkipForPullRequest skips when a configured label is present (#2062)", async () => {
+    const manifest = parseFocusManifest({ review: { auto_review: { skip_labels: ["wip"] } } });
+    const loadSpy = vi.spyOn(focusManifestLoader, "loadRepoFocusManifest").mockResolvedValue(manifest);
+    const auditSpy = vi.spyOn(repositoriesModule, "recordAuditEvent").mockResolvedValue(undefined);
+
+    await expect(
+      resolveAutoReviewSkipForPullRequest({} as Env, {
+        authorBlacklisted: false,
+        isFrozenForManualReview: false,
+        repoFullName: "acme/widgets",
+        pr: { number: 8, title: "feat", baseRef: "main", isDraft: false, labels: ["WIP"] },
+        author: "alice",
+        deliveryId: "d8",
+        headSha: "sha8",
+      }),
+    ).resolves.toEqual({ skipReason: "review skipped (configured label)", reviewManifest: manifest });
+    expect(auditSpy).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ detail: "review skipped (configured label)" }),
+    );
+
+    loadSpy.mockRestore();
+    auditSpy.mockRestore();
+  });
+
   it("resolveReviewManifestForAiReview reuses cached manifest or loads fail-safely", async () => {
     const manifest = parseFocusManifest({ review: { auto_review: { skip_drafts: true } } });
     const loadSpy = vi.spyOn(focusManifestLoader, "loadRepoFocusManifest");

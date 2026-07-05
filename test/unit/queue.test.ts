@@ -13370,6 +13370,88 @@ describe("queue processors", () => {
     expect(JSON.parse(visibilitySkip?.metadata_json ?? "{}")).toMatchObject({ deliveryId: "ignored-author-skip" });
   });
 
+  it("publishes a skipped review check for configured skip_labels (#2062)", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await persistRegistrySnapshot(
+      env,
+      normalizeRegistryPayload(
+        { "JSONbored/gittensory": { emission_share: 0.01, issue_discovery_share: 0 } },
+        { kind: "raw-github", url: "https://example.test" },
+        "2026-05-23T00:00:00.000Z",
+      ),
+    );
+    await upsertRepositoryFromGitHub(env, { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }, 123);
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      publicSurface: "comment_only",
+      autoLabelEnabled: false,
+      checkRunMode: "off",
+      gateCheckMode: "enabled",
+      linkedIssueGateMode: "block",
+    });
+    const calls = { skippedChecks: 0, comments: 0, minerList: 0 };
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "https://api.gittensor.io/miners") {
+        calls.minerList += 1;
+        return Response.json([]);
+      }
+      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      if (url.includes("/commits/skiplabel123/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+      if (url.includes("/issues/58/comments")) {
+        calls.comments += 1;
+        return Response.json([]);
+      }
+      if (url.includes("/check-runs") && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { status?: string; conclusion?: string; output?: { title?: string; summary?: string } };
+        expect(body).toMatchObject({
+          status: "completed",
+          conclusion: "skipped",
+          output: {
+            title: "Gittensory Orb Review Agent skipped",
+            summary: "Review skipped: wip label present.",
+          },
+        });
+        calls.skippedChecks += 1;
+        return Response.json({ id: 931 }, { status: 201 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    await upsertRepoFocusManifest(env, "JSONbored/gittensory", {
+      gate: { linkedIssue: "block" },
+      review: { auto_review: { skip_labels: ["wip"] } },
+    });
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "skip-label-skip",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: {
+          number: 58,
+          title: "Work in progress",
+          state: "open",
+          user: { login: "alice" },
+          head: { sha: "skiplabel123" },
+          labels: [{ name: "WIP" }],
+          body: "No issue link.",
+        },
+      },
+    });
+
+    expect(calls).toEqual({ skippedChecks: 1, comments: 0, minerList: 0 });
+    const visibilitySkip = await env.DB.prepare("select detail, metadata_json from audit_events where event_type = ? and target_key = ?")
+      .bind("github_app.pr_visibility_skipped", "JSONbored/gittensory#58")
+      .first<{ detail: string; metadata_json: string }>();
+    expect(visibilitySkip?.detail).toBe("skip_label");
+    expect(JSON.parse(visibilitySkip?.metadata_json ?? "{}")).toMatchObject({ deliveryId: "skip-label-skip" });
+  });
+
   it("audits ignored authors without a skipped check when review checks are disabled", async () => {
     const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
     await persistRegistrySnapshot(

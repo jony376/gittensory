@@ -239,7 +239,6 @@ import {
 import {
   DEFAULT_AUTO_MAINTAIN_POLICY,
   autonomyRequiresApproval,
-  isActingAutonomyLevel,
   isAgentConfigured,
   resolveAutonomy,
 } from "../settings/autonomy";
@@ -293,7 +292,6 @@ import { resolveGlobalContributorOpenItemCap, resolveGlobalContributorOpenItemCa
 import { detectMigrationCollisions, extractMigrationNumber, KNOWN_MIGRATION_DUPLICATES } from "../db/migration-collisions";
 import { listMigrationFilenamesAtRef } from "../github/migration-tree";
 import {
-  applyModerationEscalationForRule,
   executeAgentMaintenanceActions,
   executeIssueMaintenanceActions,
   pendingClosureLabelApplied,
@@ -528,7 +526,6 @@ import { classifyConfigurationCommandRequest } from "../github/configuration-com
 import { summarizeEffectiveConfig } from "../settings/effective-config-summary";
 import {
   buildReviewGroundingText,
-  checkSummaryText as checkFailureSummaryText,
   isGroundingEnabled,
   makeGithubFileFetcher,
 } from "../review/grounding-wire";

@@ -238,7 +238,7 @@ async function auditRows(env: Env): Promise<Array<{ outcome: string; detail: str
 
 describe("sendReviewRecapToDiscord (#1963, reuses resolveDiscordWebhook)", () => {
   const recap = buildReviewRecap({
-    repoFullName: "JSONbored/gittensory",
+    repoFullName: "JSONbored/loopover",
     generatedAt: NOW,
     windowDays: 7,
     pullRequests: [],
@@ -257,7 +257,7 @@ describe("sendReviewRecapToDiscord (#1963, reuses resolveDiscordWebhook)", () =>
     expect(result.sent).toBe(true);
     expect(calls).toHaveLength(1);
     expect(calls[0]?.url).toBe(HOOK);
-    expect(JSON.parse(calls[0]?.body ?? "{}").embeds[0].title).toContain("JSONbored/gittensory");
+    expect(JSON.parse(calls[0]?.body ?? "{}").embeds[0].title).toContain("JSONbored/loopover");
     const rows = await auditRows(env);
     expect(rows.some((r) => r.outcome === "completed")).toBe(true);
   });
@@ -397,8 +397,8 @@ describe("generateAndSendReviewRecap (#1963, manual-trigger entry point)", () =>
   it("builds the recap and returns both the recap and the delivery result together", async () => {
     vi.stubGlobal("fetch", async () => new Response(null, { status: 204 }));
     const env = envWithWebhook();
-    const { recap, delivery } = await generateAndSendReviewRecap(env, "JSONbored/gittensory", { windowDays: 7, nowIso: NOW });
-    expect(recap.repoFullName).toBe("JSONbored/gittensory");
+    const { recap, delivery } = await generateAndSendReviewRecap(env, "JSONbored/loopover", { windowDays: 7, nowIso: NOW });
+    expect(recap.repoFullName).toBe("JSONbored/loopover");
     expect(delivery.sent).toBe(true);
   });
 

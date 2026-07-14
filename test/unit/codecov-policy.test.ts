@@ -73,6 +73,7 @@ describe("Codecov policy", () => {
     expect(testResultsUploadWith.report_type).toBe("test_results");
     expect(testResultsUploadWith.disable_search).toBe(true);
     expect(testResultsUploadWith.fail_ci_if_error).toBe(false);
+    expect(testResultsUpload["continue-on-error"]).toBe(true);
   });
 
   it("measures miner lib changes for codecov patch coverage (#4864)", () => {
@@ -153,6 +154,7 @@ describe("Codecov policy", () => {
     expect(forkTestResultsWith.token).toBeUndefined();
     expect(forkTestResultsWith.report_type).toBe("test_results");
     expect(forkTestResultsWith.fail_ci_if_error).toBe(false);
+    expect(forkTestResultsUpload!["continue-on-error"]).toBe(true);
     expect(forkTestResultsWith.override_commit).toBe("${{ github.event.pull_request.head.sha }}");
     expect(String(forkTestResultsWith.override_branch)).toContain(":");
 

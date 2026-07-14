@@ -562,6 +562,7 @@ jobs:
       # after the tests and hard coverage upload have already passed.
       - name: Upload Vitest results to Codecov
         if: ${{ !cancelled() && github.event.pull_request.head.repo.fork != true }}
+        continue-on-error: true
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -575,6 +576,7 @@ jobs:
           fail_ci_if_error: false
       - name: Upload Vitest results to Codecov (fork PR tokenless)
         if: ${{ !cancelled() && github.event.pull_request.head.repo.fork == true }}
+        continue-on-error: true
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: ./reports/junit/vitest.xml

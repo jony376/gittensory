@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { loadControlPanelAccessScope } from "./control-panel-roles";
 import type { AuthIdentity } from "../auth/security";
-import type { ControlPanelRoleName, PublicSurfaceSkipReason } from "../types";
+import type { ControlPanelRoleName } from "../types";
+import type { PublicSurfaceSkipReason } from "../signals/settings-preview";
 
 export const PR_VISIBILITY_SKIP_REASONS = [
   "surface_off",

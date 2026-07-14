@@ -548,6 +548,7 @@ jobs:
       # covers it.
       - name: Upload coverage to Codecov (fork PR tokenless)
         if: ${{ success() && github.event.pull_request.head.repo.fork == true }}
+        continue-on-error: true
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: ./coverage/lcov.info

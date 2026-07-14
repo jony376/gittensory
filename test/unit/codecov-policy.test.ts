@@ -131,6 +131,7 @@ describe("Codecov policy", () => {
     expect(forkCoverageWith.files).toBe("./coverage/lcov.info");
     expect(forkCoverageWith.disable_search).toBe(true);
     expect(forkCoverageWith.fail_ci_if_error).toBe(true);
+    expect(forkCoverageUpload!["continue-on-error"]).toBe(true);
     // GITHUB_SHA is the ephemeral auto-merge commit on pull_request events, and codecov-cli's fallback to
     // recover the real head sha assumes a 2-parent merge commit at HEAD -- which our checkout step (it
     // fetches github.event.pull_request.head.sha directly) never produces. Without an explicit override,

@@ -25,29 +25,6 @@ function parseRepoArg(value, usage) {
   return { repoFullName: `${owner}/${repo}` };
 }
 
-function parseJsonFlag(args) {
-  const options = { json: false, dryRun: false };
-  const positional = [];
-
-  for (const token of args) {
-    if (token === "--json") {
-      options.json = true;
-      continue;
-    }
-    // #4847: reports what a real mutation would do and returns before opening the portfolio queue at all.
-    if (token === "--dry-run") {
-      options.dryRun = true;
-      continue;
-    }
-    if (token.startsWith("-")) {
-      return { error: `Unknown option: ${token}` };
-    }
-    positional.push(token);
-  }
-
-  return { positional, ...options };
-}
-
 export function parseQueueListArgs(args) {
   const options = { json: false, repoFullName: null };
   const positional = [];

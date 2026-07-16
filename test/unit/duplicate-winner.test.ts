@@ -1,39 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { isDuplicateClusterWinner, isDuplicateClusterWinnerByClaim, resolveDuplicateClusterWinnerNumber } from "../../src/signals/duplicate-winner";
+import { isDuplicateClusterWinnerByClaim, resolveDuplicateClusterWinnerNumber } from "../../src/signals/duplicate-winner";
 import { dupWinnerLinkedDuplicateCount, dupWinnerLinkedDuplicateWinnerNumber, linkedIssueDuplicatePullRequestsForGate } from "../../src/queue/processors";
 import type { PullRequestRecord } from "../../src/types";
 import { listOtherOpenPullRequests, listOtherOpenPullRequestsForAuthor, upsertPullRequestFromGitHub } from "../../src/db/repositories";
 import { createTestEnv } from "../helpers/d1";
-
-describe("isDuplicateClusterWinner (#dup-winner)", () => {
-  it("the lowest open sibling number wins", () => {
-    expect(isDuplicateClusterWinner(12, [13, 14])).toBe(true);
-  });
-
-  it("a lower open sibling beats this PR (loser)", () => {
-    expect(isDuplicateClusterWinner(14, [12, 13])).toBe(false);
-  });
-
-  it("an empty sibling list ⇒ winner (alone in/out of the cluster)", () => {
-    expect(isDuplicateClusterWinner(7, [])).toBe(true);
-  });
-
-  it("a sibling list that contains self is still min-based (winner when self is lowest)", () => {
-    expect(isDuplicateClusterWinner(12, [12, 13])).toBe(true);
-  });
-
-  it("a sibling list that contains self plus a lower sibling ⇒ loser", () => {
-    expect(isDuplicateClusterWinner(13, [12, 13])).toBe(false);
-  });
-
-  it("cascade: once the lowest sibling closes (drops out of the open set), the next-lowest becomes the winner", () => {
-    // Cluster {12, 13, 14}. PR 13 is a loser while 12 is still open.
-    expect(isDuplicateClusterWinner(13, [12, 14])).toBe(false);
-    // PR 12 closes (red CI) → it leaves the OPEN sibling set the caller passes. Re-eval of PR 13 now sees only
-    // {14} as the open sibling → 13 is the new winner. No permanently-orphaned cluster.
-    expect(isDuplicateClusterWinner(13, [14])).toBe(true);
-  });
-});
 
 describe("isDuplicateClusterWinnerByClaim (#dup-winner claim election)", () => {
   const claim = (number: number, linkedIssueClaimedAt: string | null) => ({ number, linkedIssueClaimedAt });

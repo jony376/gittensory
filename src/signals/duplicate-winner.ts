@@ -8,7 +8,6 @@
  * module, matching the #2282 scoring-preview extraction) is the source of truth.
  */
 export {
-  isDuplicateClusterWinner,
   isDuplicateClusterWinnerByClaim,
   resolveDuplicateClusterWinnerNumber,
   type DuplicateClaimMember,

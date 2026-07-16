@@ -2,27 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  isDuplicateClusterWinner,
   isDuplicateClusterWinnerByClaim,
   resolveDuplicateClusterWinnerNumber,
 } from "../dist/index.js";
 
 test("barrel: the public entrypoint re-exports the duplicate-winner adjudication API", () => {
-  assert.equal(typeof isDuplicateClusterWinner, "function");
   assert.equal(typeof isDuplicateClusterWinnerByClaim, "function");
   assert.equal(typeof resolveDuplicateClusterWinnerNumber, "function");
-});
-
-test("isDuplicateClusterWinner: the lowest open sibling number wins", () => {
-  assert.equal(isDuplicateClusterWinner(5, [7, 9]), true);
-});
-
-test("isDuplicateClusterWinner: a lower open sibling beats this PR (loser)", () => {
-  assert.equal(isDuplicateClusterWinner(5, [3, 9]), false);
-});
-
-test("isDuplicateClusterWinner: an empty sibling list is always a winner", () => {
-  assert.equal(isDuplicateClusterWinner(5, []), true);
 });
 
 test("isDuplicateClusterWinnerByClaim: an empty sibling list is always a winner", () => {

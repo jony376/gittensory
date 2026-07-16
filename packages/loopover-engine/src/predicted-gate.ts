@@ -205,7 +205,7 @@ export function buildPredictedGateVerdict(args: {
   // `duplicateWinnerEnabled` is INTENTIONALLY omitted (#dup-winner): the prospective PR is synthetic #0, but a
   // real new PR opened into an existing duplicate cluster gets the HIGHEST number ⇒ it is always a duplicate
   // LOSER, never the winner. So the predictor must keep showing the duplicate finding (the honest pre-submit
-  // answer). Threading the flag here would let isDuplicateClusterWinner(0, …) treat #0 as the winner and
+  // answer). Threading the flag here would let the winner election treat a placeholder #0 as the winner and
   // falsely suppress the block — a false-optimism regression. Do NOT add it without modeling #0 as the loser.
   // Thread linked-issue authors from the issues snapshot so the predictor surfaces the self-authored-linked-issue
   // finding too — evaluateGateCheck below already receives gate.selfAuthoredLinkedIssue, but without this finding it

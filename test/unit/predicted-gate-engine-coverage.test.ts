@@ -25,7 +25,7 @@ import {
   isGuardrailHit,
   matchesAny,
 } from "../../packages/loopover-engine/src/signals/change-guardrail";
-import { isDuplicateClusterWinner, isDuplicateClusterWinnerByClaim, resolveDuplicateClusterWinnerNumber } from "../../packages/loopover-engine/src/signals/duplicate-winner";
+import { isDuplicateClusterWinnerByClaim, resolveDuplicateClusterWinnerNumber } from "../../packages/loopover-engine/src/signals/duplicate-winner";
 import { buildCollisionReport, buildPreflightResult, buildPublicReadinessScore, buildQueueHealth, classifyBountyLifecycle, itemSharesPlannedLinkedIssue, predictedGateEngineInternals, termOverlap, unionScopedOverlapClusters } from "../../packages/loopover-engine/src/signals/predicted-gate-engine";
 import type { CollisionItem, FocusManifest, IssueQualityReport, PreMergeCheck, PullRequestRecord, RepositoryRecord } from "../../packages/loopover-engine/src/types/predicted-gate-types";
 
@@ -249,9 +249,7 @@ describe("predicted-gate engine module coverage (#2283)", () => {
     expect(blocked.conclusion).toBe("failure");
   });
 
-  it("exercises deprecated duplicate winner helper and lane advice branches", () => {
-    expect(isDuplicateClusterWinner(1, [2, 3])).toBe(true);
-    expect(isDuplicateClusterWinner(3, [1, 2])).toBe(false);
+  it("exercises the inactive lane advice branch", () => {
     const inactive = buildPreflightResult(
       { repoFullName: "acme/widgets", title: "Fix", body: "Closes #7", linkedIssues: [7] },
       { ...REPO, registryConfig: { ...REPO.registryConfig!, emissionShare: 0 } },

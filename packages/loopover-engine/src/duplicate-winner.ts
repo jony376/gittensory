@@ -36,21 +36,6 @@ export type DuplicateClaimMember = {
 };
 
 /**
- * True iff `prNumber` is the cluster winner: the minimum of `{prNumber} ∪ openSiblingNumbers`. An empty
- * sibling list ⇒ the PR is alone in (or out of) the cluster ⇒ winner. A sibling list that happens to contain
- * `prNumber` itself is harmless — the comparison is still min-based.
- *
- * @deprecated Use {@link isDuplicateClusterWinnerByClaim}. PR-number election is retained only for legacy
- * compatibility callers that do not have claim timestamps.
- */
-export function isDuplicateClusterWinner(prNumber: number, openSiblingNumbers: number[]): boolean {
-  for (const sibling of openSiblingNumbers) {
-    if (sibling < prNumber) return false;
-  }
-  return true;
-}
-
-/**
  * True iff `pr` is the earliest-elected claimant in the open duplicate cluster (see the module doc's
  * "ELECTION ORDER" note). Sparse legacy rows fail closed; ties between equally-ordered members use PR number.
  */

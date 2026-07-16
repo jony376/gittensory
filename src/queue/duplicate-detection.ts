@@ -65,7 +65,7 @@ export function dupWinnerLinkedDuplicateWinnerNumber(
  * GitHub but is still cached `open` would keep "winning" the duplicate cluster, demoting the real lowest-OPEN PR
  * to a loser and auto-closing it via the `duplicate_pr_risk` blocker. Only a LOWER-numbered overlapping sibling
  * can demote this PR from winner, so re-fetch the LIVE state of just those siblings and drop any that are no
- * longer open. Then the downstream election ({@link isDuplicateClusterWinner}) reflects ground truth.
+ * longer open. Then the downstream election ({@link isDuplicateClusterWinnerByClaim}) reflects ground truth.
  *
  * FAIL-OPEN to the stored state: a sibling is dropped ONLY on a positive "not open" confirmation — an unreadable
  * live fetch keeps it, so a transient GitHub hiccup never newly spares a real loser. Flag-OFF (default), no

@@ -62,7 +62,7 @@ export function buildMaintainerActivationPreview(args: {
   const codeCounts = new Map<string, number>();
   const samples: MaintainerActivationSample[] = recent.map((pr) => {
     const advisory = buildPullRequestAdvisory(args.repo, pr, {
-      // Open-only siblings: a closed/merged PR isn't competing, and isDuplicateClusterWinner's invariant
+      // Open-only siblings: a closed/merged PR isn't competing, and isDuplicateClusterWinnerByClaim's invariant
       // requires open-only numbers — match the live pipeline (processors.ts:559/800), which feeds the
       // winner adjudication the same open-filtered set.
       otherOpenPullRequests: args.pullRequests.filter((other) => other.number !== pr.number && other.state === "open"),

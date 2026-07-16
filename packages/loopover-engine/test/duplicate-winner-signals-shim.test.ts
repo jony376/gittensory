@@ -5,7 +5,6 @@ import * as topLevel from "../dist/duplicate-winner.js";
 import * as signalsShim from "../dist/signals/duplicate-winner.js";
 
 test("signals/duplicate-winner is a thin re-export of the top-level module (#4251)", () => {
-  assert.equal(signalsShim.isDuplicateClusterWinner, topLevel.isDuplicateClusterWinner);
   assert.equal(signalsShim.isDuplicateClusterWinnerByClaim, topLevel.isDuplicateClusterWinnerByClaim);
   assert.equal(
     signalsShim.resolveDuplicateClusterWinnerNumber,

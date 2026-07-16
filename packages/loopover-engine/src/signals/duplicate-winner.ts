@@ -7,7 +7,6 @@
  * `../signals/duplicate-winner.js` import keeps resolving without a call-site change.
  */
 export {
-  isDuplicateClusterWinner,
   isDuplicateClusterWinnerByClaim,
   resolveDuplicateClusterWinnerNumber,
   type DuplicateClaimMember,

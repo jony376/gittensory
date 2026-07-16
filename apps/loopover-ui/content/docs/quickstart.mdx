@@ -3,6 +3,13 @@ title: Quickstart
 description: Install the MCP, sign in, and run your first analysis. About two minutes.
 ---
 
+<Callout variant="info">
+  AMS also works against ordinary GitHub repositories: ORB is optional, gittensor registration is
+  optional, and a missing `.loopover.yml` does not block discovery, analysis, or attempts. Live PR
+  writes still honor AMS's own live-mode gates (`LOOPOVER_MINER_LIVE_MODE=live` plus the target
+  repo's `.loopover-miner.yml` opt-in).
+</Callout>
+
 ## 1. Install
 
 The MCP is published as `@loopover/mcp`. You can run it with `npx`, or

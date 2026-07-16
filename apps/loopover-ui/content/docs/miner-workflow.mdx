@@ -6,6 +6,12 @@ description: A deterministic four-step loop. Each step is pure metadata; each ou
 If the workflow will spawn Claude Code or Codex, configure that driver first in [Miner
 coding-agent driver](/docs/miner-coding-agent).
 
+<Callout variant="info">
+  AMS is not limited to ORB-managed repos. The miner loop can target any GitHub repository you can
+  access, even when the repo is not gittensor-registered and does not ship a `.loopover.yml`.
+  Autonomous PR writes remain gated separately by AMS live-mode opt-ins.
+</Callout>
+
 ## The mirrored loop
 
 Each step on the left is what the contributor runs; the matching step on the right is what the

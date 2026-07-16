@@ -58,6 +58,7 @@ import { Route as DocsFumadocsSpikeApiReferenceRouteImport } from './routes/docs
 import { Route as DocsBranchAnalysisRouteImport } from './routes/docs.branch-analysis'
 import { Route as DocsBetaOnboardingRouteImport } from './routes/docs.beta-onboarding'
 import { Route as DocsAmsOperationsRunbookRouteImport } from './routes/docs.ams-operations-runbook'
+import { Route as DocsAmsObservabilityRouteImport } from './routes/docs.ams-observability'
 import { Route as DocsAmsDeploymentRouteImport } from './routes/docs.ams-deployment'
 import { Route as DocsAiSummariesRouteImport } from './routes/docs.ai-summaries'
 import { Route as AppWorkbenchRouteImport } from './routes/app.workbench'
@@ -336,6 +337,11 @@ const DocsAmsOperationsRunbookRoute =
     path: '/ams-operations-runbook',
     getParentRoute: () => DocsRoute,
   } as any)
+const DocsAmsObservabilityRoute = DocsAmsObservabilityRouteImport.update({
+  id: '/ams-observability',
+  path: '/ams-observability',
+  getParentRoute: () => DocsRoute,
+} as any)
 const DocsAmsDeploymentRoute = DocsAmsDeploymentRouteImport.update({
   id: '/ams-deployment',
   path: '/ams-deployment',
@@ -449,6 +455,7 @@ export interface FileRoutesByFullPath {
   '/app/workbench': typeof AppWorkbenchRoute
   '/docs/ai-summaries': typeof DocsAiSummariesRoute
   '/docs/ams-deployment': typeof DocsAmsDeploymentRoute
+  '/docs/ams-observability': typeof DocsAmsObservabilityRoute
   '/docs/ams-operations-runbook': typeof DocsAmsOperationsRunbookRoute
   '/docs/beta-onboarding': typeof DocsBetaOnboardingRoute
   '/docs/branch-analysis': typeof DocsBranchAnalysisRoute
@@ -514,6 +521,7 @@ export interface FileRoutesByTo {
   '/app/workbench': typeof AppWorkbenchRoute
   '/docs/ai-summaries': typeof DocsAiSummariesRoute
   '/docs/ams-deployment': typeof DocsAmsDeploymentRoute
+  '/docs/ams-observability': typeof DocsAmsObservabilityRoute
   '/docs/ams-operations-runbook': typeof DocsAmsOperationsRunbookRoute
   '/docs/beta-onboarding': typeof DocsBetaOnboardingRoute
   '/docs/branch-analysis': typeof DocsBranchAnalysisRoute
@@ -583,6 +591,7 @@ export interface FileRoutesById {
   '/app/workbench': typeof AppWorkbenchRoute
   '/docs/ai-summaries': typeof DocsAiSummariesRoute
   '/docs/ams-deployment': typeof DocsAmsDeploymentRoute
+  '/docs/ams-observability': typeof DocsAmsObservabilityRoute
   '/docs/ams-operations-runbook': typeof DocsAmsOperationsRunbookRoute
   '/docs/beta-onboarding': typeof DocsBetaOnboardingRoute
   '/docs/branch-analysis': typeof DocsBranchAnalysisRoute
@@ -653,6 +662,7 @@ export interface FileRouteTypes {
     | '/app/workbench'
     | '/docs/ai-summaries'
     | '/docs/ams-deployment'
+    | '/docs/ams-observability'
     | '/docs/ams-operations-runbook'
     | '/docs/beta-onboarding'
     | '/docs/branch-analysis'
@@ -718,6 +728,7 @@ export interface FileRouteTypes {
     | '/app/workbench'
     | '/docs/ai-summaries'
     | '/docs/ams-deployment'
+    | '/docs/ams-observability'
     | '/docs/ams-operations-runbook'
     | '/docs/beta-onboarding'
     | '/docs/branch-analysis'
@@ -786,6 +797,7 @@ export interface FileRouteTypes {
     | '/app/workbench'
     | '/docs/ai-summaries'
     | '/docs/ams-deployment'
+    | '/docs/ams-observability'
     | '/docs/ams-operations-runbook'
     | '/docs/beta-onboarding'
     | '/docs/branch-analysis'
@@ -1187,6 +1199,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DocsAmsOperationsRunbookRouteImport
       parentRoute: typeof DocsRoute
     }
+    '/docs/ams-observability': {
+      id: '/docs/ams-observability'
+      path: '/ams-observability'
+      fullPath: '/docs/ams-observability'
+      preLoaderRoute: typeof DocsAmsObservabilityRouteImport
+      parentRoute: typeof DocsRoute
+    }
     '/docs/ams-deployment': {
       id: '/docs/ams-deployment'
       path: '/ams-deployment'
@@ -1360,6 +1379,7 @@ const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)
 interface DocsRouteChildren {
   DocsAiSummariesRoute: typeof DocsAiSummariesRoute
   DocsAmsDeploymentRoute: typeof DocsAmsDeploymentRoute
+  DocsAmsObservabilityRoute: typeof DocsAmsObservabilityRoute
   DocsAmsOperationsRunbookRoute: typeof DocsAmsOperationsRunbookRoute
   DocsBetaOnboardingRoute: typeof DocsBetaOnboardingRoute
   DocsBranchAnalysisRoute: typeof DocsBranchAnalysisRoute
@@ -1402,6 +1422,7 @@ interface DocsRouteChildren {
 const DocsRouteChildren: DocsRouteChildren = {
   DocsAiSummariesRoute: DocsAiSummariesRoute,
   DocsAmsDeploymentRoute: DocsAmsDeploymentRoute,
+  DocsAmsObservabilityRoute: DocsAmsObservabilityRoute,
   DocsAmsOperationsRunbookRoute: DocsAmsOperationsRunbookRoute,
   DocsBetaOnboardingRoute: DocsBetaOnboardingRoute,
   DocsBranchAnalysisRoute: DocsBranchAnalysisRoute,

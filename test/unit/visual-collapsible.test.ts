@@ -63,6 +63,31 @@ describe("buildBeforeAfterCollapsible", () => {
     expect(c?.body).not.toContain("—<br>");
   });
 
+  it("#6324: the <img src> prefers a route's beforeThumbUrl/afterThumbUrl over the full-resolution beforeUrl/afterUrl, but <a href> ALWAYS points at the full-resolution original", () => {
+    const c = buildBeforeAfterCollapsible([
+      {
+        path: "/app/analytics",
+        beforeUrl: "https://api.example.dev/gittensory/shot?key=gittensory/shots/full-before.png",
+        beforeThumbUrl: "https://api.example.dev/gittensory/shot?key=gittensory/shots/thumb-before.png",
+        afterUrl: "https://api.example.dev/gittensory/shot?key=gittensory/shots/full-after.png",
+        afterThumbUrl: "https://api.example.dev/gittensory/shot?key=gittensory/shots/thumb-after.png",
+      },
+    ]);
+    // href = full-resolution (click to open full-size); img src = the smaller thumb.
+    expect(c?.body).toContain('<a href="https://api.example.dev/gittensory/shot?key=gittensory/shots/full-before.png" target="_blank" rel="noopener"><img width="360" alt="before /app/analytics" src="https://api.example.dev/gittensory/shot?key=gittensory/shots/thumb-before.png">');
+    expect(c?.body).toContain('<a href="https://api.example.dev/gittensory/shot?key=gittensory/shots/full-after.png" target="_blank" rel="noopener"><img width="360" alt="after /app/analytics" src="https://api.example.dev/gittensory/shot?key=gittensory/shots/thumb-after.png">');
+    // The full-resolution URLs never appear as an img src (only inside an href).
+    expect(c?.body).not.toContain('src="https://api.example.dev/gittensory/shot?key=gittensory/shots/full-before.png"');
+    expect(c?.body).not.toContain('src="https://api.example.dev/gittensory/shot?key=gittensory/shots/full-after.png"');
+  });
+
+  it("#6324: falls back to the full-resolution URL for the img src when no thumb URL is present (hosted mode, or mobile rows, which never get one)", () => {
+    const c = buildBeforeAfterCollapsible(routes);
+    // routes (the shared fixture below) has no beforeThumbUrl/afterThumbUrl -- src and href must be identical.
+    expect(c?.body).toContain('<img width="360" alt="before /app/analytics" src="https://api.example.dev/gittensory/shot?key=gittensory/shots/abc.png">');
+    expect(c?.body).toContain('<img width="360" alt="after /app/analytics" src="https://api.example.dev/gittensory/shot?key=gittensory/shots/def.png">');
+  });
+
   it("returns null when no route has any shot URL (no empty table)", () => {
     expect(buildBeforeAfterCollapsible([])).toBeNull();
     expect(buildBeforeAfterCollapsible([{ path: "/" }])).toBeNull();

@@ -7,6 +7,7 @@ import {
 import { fallbackShotR2Key, markFallbackDispatched } from "../../src/review/visual/actions-fallback";
 import { buildCapture, fetchExternalScreenshotContentBlock, fetchShotContentBlock, hasSuccessfulBotCapture, mapFilesToRoutes, resolvePreviewUrlTemplate, resolveVisualRoutes } from "../../src/review/visual/capture";
 import type { CaptureRoute } from "../../src/review/visual/capture";
+import * as imageDownscaleModule from "../../src/review/visual/image-downscale";
 import * as pixelDiffModule from "../../src/review/visual/pixel-diff";
 import { MAX_PREVIEW_POLL_ATTEMPTS, previewPollAttemptCount, recordPreviewPollAttempt } from "../../src/review/visual/preview-poll-budget";
 import * as previewUrlModule from "../../src/review/visual/preview-url";
@@ -17,18 +18,22 @@ import { createTestEnv } from "../helpers/d1";
 
 /** Minimal in-memory R2Bucket-compatible store (mirrors the self-host filesystem blob-store's get/put
  *  surface) — lets a test pre-seed a "cached" screenshot at the exact fingerprinted key capturePage derives,
- *  without needing a real browser binding to produce fresh bytes. `failPut: true` makes every put() reject,
- *  for testing the caller's own `.catch(() => undefined)` degrade-gracefully path. */
-function memoryReviewAudit(options: { failPut?: boolean; failGet?: boolean } = {}): R2Bucket {
+ *  without needing a real browser binding to produce fresh bytes. `failPut`/`failGet: true` makes EVERY
+ *  put()/get() reject, for testing the caller's own `.catch(() => undefined)` degrade-gracefully path.
+ *  `failPutKeys`/`failGetKeys` (#6324) instead fail ONLY the listed keys, leaving every other key's
+ *  read/write to behave normally -- needed to simulate a failure on ONE of the two sibling writes
+ *  capturePage's thumbnail logic makes (the original succeeds, the thumb independently fails, or vice
+ *  versa) without breaking the rest of the flow that has to succeed for the test to reach that code at all. */
+function memoryReviewAudit(options: { failPut?: boolean; failGet?: boolean; failPutKeys?: string[]; failGetKeys?: string[] } = {}): R2Bucket {
   const store = new Map<string, Uint8Array>();
   return {
     async get(key: string) {
-      if (options.failGet) throw new Error("simulated storage read failure");
+      if (options.failGet || options.failGetKeys?.includes(key)) throw new Error("simulated storage read failure");
       const bytes = store.get(key);
       return bytes ? ({ body: new Response(bytes).body } as unknown as R2ObjectBody) : null;
     },
     async put(key: string, value: unknown) {
-      if (options.failPut) throw new Error("simulated storage failure");
+      if (options.failPut || options.failPutKeys?.includes(key)) throw new Error("simulated storage failure");
       const bytes = new Uint8Array(await new Response(value as BodyInit).arrayBuffer());
       store.set(key, bytes);
       return { key } as unknown as R2Object;
@@ -58,6 +63,13 @@ function reviewAuditWithBrokenCachedBody(key: string): R2Bucket {
 async function shotKey(prNumber: number, slot: "before" | "after", viewportName: "desktop" | "mobile", page: string): Promise<string> {
   const fingerprint = await sha256Hex(`${prNumber}:${slot}:${viewportName}:${page}`);
   return `loopover/shots/${fingerprint.slice(0, 40)}.png`;
+}
+
+/** #6324: the sibling key a downscaled DISPLAY copy is stored under -- same fingerprint as shotKey, `-thumb`
+ *  suffix before the extension. */
+async function thumbKey(prNumber: number, slot: "before" | "after", viewportName: "desktop" | "mobile", page: string): Promise<string> {
+  const fingerprint = await sha256Hex(`${prNumber}:${slot}:${viewportName}:${page}`);
+  return `loopover/shots/${fingerprint.slice(0, 40)}-thumb.png`;
 }
 
 afterEach(() => {
@@ -752,6 +764,262 @@ describe("buildCapture pixel-diff wiring (#3674)", () => {
     } finally {
       availableSpy.mockRestore();
       compareSpy.mockRestore();
+    }
+  });
+});
+
+describe("buildCapture display-thumbnail wiring (#6324)", () => {
+  it("never attempts a thumbnail when display downscaling is unavailable (the real, unmocked default) — byte-identical to pre-#6324", async () => {
+    const downscaleSpy = vi.spyOn(imageDownscaleModule, "downscaleForDisplay");
+    const captureShotSpy = vi.spyOn(shotModule, "captureShot").mockResolvedValue({ png: new Uint8Array([9, 9, 9]), authWalled: false });
+    try {
+      const result = await buildCapture(
+        createTestEnv({ PUBLIC_API_ORIGIN: "https://worker.example", PUBLIC_SITE_ORIGIN: "https://prod.example.com", REVIEW_AUDIT: memoryReviewAudit() }),
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 40, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+      expect(downscaleSpy).not.toHaveBeenCalled();
+      expect(result.routes[0]?.beforeThumbUrl).toBeUndefined();
+      expect(result.routes[0]?.afterThumbUrl).toBeUndefined();
+    } finally {
+      downscaleSpy.mockRestore();
+      captureShotSpy.mockRestore();
+    }
+  });
+
+  it("generates + stores a thumbnail and threads beforeThumbUrl/afterThumbUrl when downscaling is available and genuinely shrinks the image", async () => {
+    const availableSpy = vi.spyOn(imageDownscaleModule, "isDisplayDownscaleAvailable").mockReturnValue(true);
+    const downscaleSpy = vi.spyOn(imageDownscaleModule, "downscaleForDisplay").mockResolvedValue(new Uint8Array([1]));
+    const captureShotSpy = vi.spyOn(shotModule, "captureShot").mockResolvedValue({ png: new Uint8Array([9, 9, 9]), authWalled: false });
+    try {
+      const env = createTestEnv({ PUBLIC_API_ORIGIN: "https://worker.example", PUBLIC_SITE_ORIGIN: "https://prod.example.com", REVIEW_AUDIT: memoryReviewAudit() });
+      const result = await buildCapture(
+        env,
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 41, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+      expect(result.routes[0]?.beforeThumbUrl).toContain("/loopover/shot?key=");
+      expect(result.routes[0]?.beforeThumbUrl).toContain("-thumb.png");
+      expect(result.routes[0]?.afterThumbUrl).toContain("-thumb.png");
+      // The full-resolution URL is UNCHANGED -- still what "click to open full-size" resolves to.
+      expect(result.routes[0]?.beforeUrl).not.toContain("-thumb.png");
+      const storedThumb = await env.REVIEW_AUDIT!.get(await thumbKey(41, "before", "desktop", "https://prod.example.com/app"));
+      expect(storedThumb).not.toBeNull();
+    } finally {
+      availableSpy.mockRestore();
+      downscaleSpy.mockRestore();
+      captureShotSpy.mockRestore();
+    }
+  });
+
+  it("never generates a thumbnail for the mobile viewport, even when downscaling is available — 390px is already close to the table's 360px display width", async () => {
+    const availableSpy = vi.spyOn(imageDownscaleModule, "isDisplayDownscaleAvailable").mockReturnValue(true);
+    const downscaleSpy = vi.spyOn(imageDownscaleModule, "downscaleForDisplay").mockResolvedValue(new Uint8Array([1]));
+    const captureShotSpy = vi.spyOn(shotModule, "captureShot").mockResolvedValue({ png: new Uint8Array([9, 9, 9]), authWalled: false });
+    try {
+      const result = await buildCapture(
+        createTestEnv({ PUBLIC_API_ORIGIN: "https://worker.example", PUBLIC_SITE_ORIGIN: "https://prod.example.com", REVIEW_AUDIT: memoryReviewAudit() }),
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 42, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+      // downscaleForDisplay was called for the desktop slots only -- CaptureRoute has no mobile thumb field
+      // at all (by design), so there's nothing to assert false on the route itself; the real assertion is
+      // that the call count matches "desktop before + desktop after" (2), not 4 (every slot).
+      expect(downscaleSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      availableSpy.mockRestore();
+      downscaleSpy.mockRestore();
+      captureShotSpy.mockRestore();
+    }
+  });
+
+  it("skips storing/using a thumbnail when downscaling didn't actually shrink the image (already narrow, or a decode failure that degraded to the original bytes)", async () => {
+    const same = new Uint8Array([9, 9, 9]);
+    const availableSpy = vi.spyOn(imageDownscaleModule, "isDisplayDownscaleAvailable").mockReturnValue(true);
+    const downscaleSpy = vi.spyOn(imageDownscaleModule, "downscaleForDisplay").mockResolvedValue(same);
+    const captureShotSpy = vi.spyOn(shotModule, "captureShot").mockResolvedValue({ png: same, authWalled: false });
+    try {
+      const env = createTestEnv({ PUBLIC_API_ORIGIN: "https://worker.example", PUBLIC_SITE_ORIGIN: "https://prod.example.com", REVIEW_AUDIT: memoryReviewAudit() });
+      const result = await buildCapture(
+        env,
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 43, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+      expect(result.routes[0]?.beforeThumbUrl).toBeUndefined();
+      const storedThumb = await env.REVIEW_AUDIT!.get(await thumbKey(43, "before", "desktop", "https://prod.example.com/app"));
+      expect(storedThumb).toBeNull();
+    } finally {
+      availableSpy.mockRestore();
+      downscaleSpy.mockRestore();
+      captureShotSpy.mockRestore();
+    }
+  });
+
+  it("degrades to the original bytes (never throws) when downscaleForDisplay itself rejects", async () => {
+    const availableSpy = vi.spyOn(imageDownscaleModule, "isDisplayDownscaleAvailable").mockReturnValue(true);
+    const downscaleSpy = vi.spyOn(imageDownscaleModule, "downscaleForDisplay").mockRejectedValue(new Error("simulated decode failure"));
+    const captureShotSpy = vi.spyOn(shotModule, "captureShot").mockResolvedValue({ png: new Uint8Array([9, 9, 9]), authWalled: false });
+    try {
+      const result = await buildCapture(
+        createTestEnv({ PUBLIC_API_ORIGIN: "https://worker.example", PUBLIC_SITE_ORIGIN: "https://prod.example.com", REVIEW_AUDIT: memoryReviewAudit() }),
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 44, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+      expect(result.routes[0]?.beforeUrl).toContain("/loopover/shot?key=");
+      expect(result.routes[0]?.beforeThumbUrl).toBeUndefined();
+    } finally {
+      availableSpy.mockRestore();
+      downscaleSpy.mockRestore();
+      captureShotSpy.mockRestore();
+    }
+  });
+
+  it("re-verifies the thumbnail actually exists on a cache hit rather than assuming it from the original's own presence", async () => {
+    const availableSpy = vi.spyOn(imageDownscaleModule, "isDisplayDownscaleAvailable").mockReturnValue(true);
+    try {
+      const env = createTestEnv({ PUBLIC_API_ORIGIN: "https://worker.example", PUBLIC_SITE_ORIGIN: "https://prod.example.com", REVIEW_AUDIT: memoryReviewAudit() });
+      // Pre-seed ONLY the original -- simulates the sibling thumb write having failed on a PRIOR render.
+      const beforeKey = await shotKey(45, "before", "desktop", "https://prod.example.com/app");
+      await env.REVIEW_AUDIT!.put(beforeKey, new Uint8Array([1, 2, 3]), {} as R2PutOptions);
+
+      const result = await buildCapture(
+        env,
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 45, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+
+      expect(result.routes[0]?.beforeUrl).toContain("/loopover/shot?key=");
+      expect(result.routes[0]?.beforeThumbUrl).toBeUndefined();
+    } finally {
+      availableSpy.mockRestore();
+    }
+  });
+
+  it("finds a genuinely-cached thumbnail on a cache hit and threads its URL", async () => {
+    const availableSpy = vi.spyOn(imageDownscaleModule, "isDisplayDownscaleAvailable").mockReturnValue(true);
+    try {
+      const env = createTestEnv({ PUBLIC_API_ORIGIN: "https://worker.example", PUBLIC_SITE_ORIGIN: "https://prod.example.com", REVIEW_AUDIT: memoryReviewAudit() });
+      const beforeKey = await shotKey(46, "before", "desktop", "https://prod.example.com/app");
+      const beforeThumbKey = await thumbKey(46, "before", "desktop", "https://prod.example.com/app");
+      await env.REVIEW_AUDIT!.put(beforeKey, new Uint8Array([1, 2, 3]), {} as R2PutOptions);
+      await env.REVIEW_AUDIT!.put(beforeThumbKey, new Uint8Array([1]), {} as R2PutOptions);
+
+      const result = await buildCapture(
+        env,
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 46, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+
+      expect(result.routes[0]?.beforeThumbUrl).toContain(encodeURIComponent(beforeThumbKey));
+    } finally {
+      availableSpy.mockRestore();
+    }
+  });
+
+  it("#6324 CORRECTNESS: the pixel-diff provider always receives the ORIGINAL full-resolution bytes, never the downscaled display copy — even though a thumbnail was generated in the SAME call", async () => {
+    const diffAvailableSpy = vi.spyOn(pixelDiffModule, "isVisualDiffAvailable").mockReturnValue(true);
+    const compareSpy = vi.spyOn(pixelDiffModule, "compareCapturedScreenshots").mockResolvedValue(null);
+    const downscaleAvailableSpy = vi.spyOn(imageDownscaleModule, "isDisplayDownscaleAvailable").mockReturnValue(true);
+    const downscaleSpy = vi.spyOn(imageDownscaleModule, "downscaleForDisplay").mockResolvedValue(new Uint8Array([1]));
+    const originalBefore = new Uint8Array([10, 20, 30]);
+    const originalAfter = new Uint8Array([40, 50, 60]);
+    const captureShotSpy = vi
+      .spyOn(shotModule, "captureShot")
+      .mockImplementation(async (_env, url: string) => ({ png: url.includes("preview.example.com") ? originalAfter : originalBefore, authWalled: false }));
+    try {
+      await buildCapture(
+        createTestEnv({ PUBLIC_API_ORIGIN: "https://worker.example", PUBLIC_SITE_ORIGIN: "https://prod.example.com", REVIEW_AUDIT: memoryReviewAudit() }),
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 47, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+      const desktopCall = compareSpy.mock.calls.find(([before, after]) => before !== undefined || after !== undefined);
+      expect(desktopCall?.[0]).toEqual(originalBefore);
+      expect(desktopCall?.[1]).toEqual(originalAfter);
+    } finally {
+      diffAvailableSpy.mockRestore();
+      compareSpy.mockRestore();
+      downscaleAvailableSpy.mockRestore();
+      downscaleSpy.mockRestore();
+      captureShotSpy.mockRestore();
+    }
+  });
+
+  it("falls back to no thumbUrl (never throws) when the thumb-key WRITE itself fails on a fresh render, even though the original write succeeded", async () => {
+    const availableSpy = vi.spyOn(imageDownscaleModule, "isDisplayDownscaleAvailable").mockReturnValue(true);
+    const downscaleSpy = vi.spyOn(imageDownscaleModule, "downscaleForDisplay").mockResolvedValue(new Uint8Array([1]));
+    const captureShotSpy = vi.spyOn(shotModule, "captureShot").mockResolvedValue({ png: new Uint8Array([9, 9, 9]), authWalled: false });
+    try {
+      const beforeThumb = await thumbKey(49, "before", "desktop", "https://prod.example.com/app");
+      const env = createTestEnv({ PUBLIC_API_ORIGIN: "https://worker.example", PUBLIC_SITE_ORIGIN: "https://prod.example.com", REVIEW_AUDIT: memoryReviewAudit({ failPutKeys: [beforeThumb] }) });
+      const result = await buildCapture(
+        env,
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 49, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+      // The ORIGINAL still saved fine and is still usable -- only the thumb-specific optimization is absent.
+      expect(result.routes[0]?.beforeUrl).toContain("/loopover/shot?key=");
+      expect(result.routes[0]?.beforeThumbUrl).toBeUndefined();
+    } finally {
+      availableSpy.mockRestore();
+      downscaleSpy.mockRestore();
+      captureShotSpy.mockRestore();
+    }
+  });
+
+  it("falls back to no thumbUrl (never throws) when re-verifying the thumb's existence on a cache hit itself fails to read", async () => {
+    const availableSpy = vi.spyOn(imageDownscaleModule, "isDisplayDownscaleAvailable").mockReturnValue(true);
+    try {
+      const beforeKey = await shotKey(50, "before", "desktop", "https://prod.example.com/app");
+      const beforeThumb = await thumbKey(50, "before", "desktop", "https://prod.example.com/app");
+      const env = createTestEnv({ PUBLIC_API_ORIGIN: "https://worker.example", PUBLIC_SITE_ORIGIN: "https://prod.example.com", REVIEW_AUDIT: memoryReviewAudit({ failGetKeys: [beforeThumb] }) });
+      await env.REVIEW_AUDIT!.put(beforeKey, new Uint8Array([1, 2, 3]), {} as R2PutOptions);
+
+      const result = await buildCapture(
+        env,
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 50, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+
+      expect(result.routes[0]?.beforeUrl).toContain("/loopover/shot?key=");
+      expect(result.routes[0]?.beforeThumbUrl).toBeUndefined();
+    } finally {
+      availableSpy.mockRestore();
+    }
+  });
+
+  it("links a thumbnail directly at the bucket instead of this instance's /loopover/shot proxy when REVIEW_AUDIT_S3_PUBLIC_URL is configured", async () => {
+    const availableSpy = vi.spyOn(imageDownscaleModule, "isDisplayDownscaleAvailable").mockReturnValue(true);
+    const downscaleSpy = vi.spyOn(imageDownscaleModule, "downscaleForDisplay").mockResolvedValue(new Uint8Array([1]));
+    const captureShotSpy = vi.spyOn(shotModule, "captureShot").mockResolvedValue({ png: new Uint8Array([9, 9, 9]), authWalled: false });
+    try {
+      const env = createTestEnv({
+        PUBLIC_API_ORIGIN: "https://worker.example",
+        PUBLIC_SITE_ORIGIN: "https://prod.example.com",
+        REVIEW_AUDIT: memoryReviewAudit(),
+        REVIEW_AUDIT_S3_PUBLIC_URL: "https://pub-abc123.r2.dev",
+      });
+      const result = await buildCapture(
+        env,
+        "installation-token",
+        { repoFullName: "owner/repo", prNumber: 48, previewUrl: "https://preview.example.com" },
+        ["apps/loopover-ui/src/routes/app.index.tsx"],
+      );
+      const expectedThumbKey = await thumbKey(48, "before", "desktop", "https://prod.example.com/app");
+      expect(result.routes[0]?.beforeThumbUrl).toBe(`https://pub-abc123.r2.dev/${expectedThumbKey}`);
+    } finally {
+      availableSpy.mockRestore();
+      downscaleSpy.mockRestore();
+      captureShotSpy.mockRestore();
     }
   });
 });

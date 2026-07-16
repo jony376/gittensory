@@ -17,7 +17,7 @@
 import { base64Encode, sha256Hex } from "../../utils/crypto";
 import type { AiContentBlock } from "../../types";
 import { isSafeHttpUrl } from "../content-lane/safe-url";
-import { downscaleForVision } from "./image-downscale";
+import { downscaleForDisplay, downscaleForVision, isDisplayDownscaleAvailable } from "./image-downscale";
 import type { GitHubRateLimitAdmissionKey } from "../../github/client";
 import { dispatchVisualCaptureFallback, fallbackShotR2Key, isFallbackDispatchInFlight, markFallbackDispatched } from "./actions-fallback";
 import { MAX_PREVIEW_POLL_ATTEMPTS, previewPollAttemptCount, recordPreviewPollAttempt } from "./preview-poll-budget";
@@ -62,6 +62,13 @@ export interface CaptureRoute {
   beforeUrlMobile?: string | undefined;
   afterUrl?: string | undefined;
   afterUrlMobile?: string | undefined;
+  // #6324: a separate, downscaled DISPLAY copy of the desktop shot -- self-host only, desktop-only (see
+  // capturePage's own doc comment for why). beforeUrl/afterUrl above are UNCHANGED in meaning (still the
+  // full-resolution original, still what "click to open full-size" resolves to); these are additive fields
+  // the comment table prefers for the embedded <img> when present, falling back to beforeUrl/afterUrl when
+  // absent (hosted mode, or a resize that didn't actually shrink anything).
+  beforeThumbUrl?: string | undefined;
+  afterThumbUrl?: string | undefined;
   diffUrl?: string | undefined;
   diffUrlMobile?: string | undefined;
   beforeGifUrl?: string | undefined;
@@ -335,7 +342,7 @@ async function capturePage(
   // theming ignores prefers-color-scheme (see shot.ts's CaptureShotOptions.theme doc). Only takes effect
   // together with `theme`; undefined (every pre-#4109 caller) ⇒ byte-identical to today.
   themeStorageKey?: string | undefined,
-): Promise<{ url?: string | undefined; png?: Uint8Array | undefined }> {
+): Promise<{ url?: string | undefined; thumbUrl?: string | undefined; png?: Uint8Array | undefined }> {
   if (!page) return {};
   const shotBase = env.PUBLIC_API_ORIGIN; // this worker's public origin (serves /loopover/shot)
   // Carries the theme (#3678) and, when set, the storage key (#4109) so a LATER on-demand fetch of this
@@ -354,11 +361,22 @@ async function capturePage(
     );
     const key = `${NAMESPACE}/shots/${fingerprint.slice(0, 40)}.png`;
     const url = resolveShotUrl(env, key) || onDemand;
+    // #6324: a downscaled DISPLAY copy, stored at a SIBLING key so the original at `key` never changes --
+    // diffing (compareCapturedScreenshots, via includeBytes below) always reads the true original on both a
+    // fresh render AND a cache hit, and "click to open full-size" keeps resolving to it unchanged. Self-host
+    // only (isDisplayDownscaleAvailable) and desktop-only: shot.ts's mobile viewport (390px) is already
+    // close enough to the table's own 360px display width that a third resized copy would save little.
+    const thumbKey = viewportName === "desktop" && isDisplayDownscaleAvailable() ? `${NAMESPACE}/shots/${fingerprint.slice(0, 40)}-thumb.png` : undefined;
     const cached = await env.REVIEW_AUDIT.get(key).catch(() => null);
     if (cached) {
-      if (!includeBytes) return { url };
+      // Verified via a real read, not assumed from the original's own existence -- the sibling write below
+      // is best-effort and can independently fail, so a stale/missing thumb must fall back to the full-res
+      // URL rather than ever risk embedding a broken image link.
+      const thumbCached = thumbKey ? await env.REVIEW_AUDIT.get(thumbKey).catch(() => null) : null;
+      const thumbUrl = thumbCached && thumbKey ? resolveShotUrl(env, thumbKey) || undefined : undefined;
+      if (!includeBytes) return { url, ...(thumbUrl ? { thumbUrl } : {}) };
       const bytes = await new Response(cached.body).arrayBuffer().then((buf) => new Uint8Array(buf)).catch(() => undefined);
-      return { url, ...(bytes ? { png: bytes } : {}) };
+      return { url, ...(thumbUrl ? { thumbUrl } : {}), ...(bytes ? { png: bytes } : {}) };
     }
     const { png, authWalled } = await captureShot(env, page, viewport, theme ? { theme, ...(themeStorageKey ? { themeStorageKey } : {}) } : {}).catch(() => ({ png: null, authWalled: false }));
     // A protected route that redirected to a sign-in wall: show an honest "requires authentication"
@@ -368,7 +386,21 @@ async function capturePage(
     }
     if (png) {
       await env.REVIEW_AUDIT.put(key, png, { httpMetadata: { contentType: "image/png" } }).catch(() => undefined);
-      return { url, ...(includeBytes ? { png } : {}) };
+      let thumbUrl: string | undefined;
+      if (thumbKey) {
+        const displayPng = await downscaleForDisplay(png).catch(() => png);
+        // Skip storing/using the thumb entirely when downscaling genuinely didn't shrink anything (an
+        // already-narrow capture, or a decode/resize failure that degraded to the original bytes) -- a
+        // byte-identical copy at a second key is pure waste, not an optimization.
+        if (displayPng.byteLength < png.byteLength) {
+          // thumbUrl must only be set once the write is CONFIRMED to have succeeded -- a bare
+          // `.catch(() => undefined)` here would swallow a write failure and still fall through to embed a
+          // URL for an object that was never actually stored, a broken image link for every viewer.
+          const stored = await env.REVIEW_AUDIT.put(thumbKey, displayPng, { httpMetadata: { contentType: "image/png" } }).then(() => true).catch(() => false);
+          if (stored) thumbUrl = resolveShotUrl(env, thumbKey) || undefined;
+        }
+      }
+      return { url, ...(thumbUrl ? { thumbUrl } : {}), ...(includeBytes ? { png } : {}) };
     }
   }
   return { url: onDemand };
@@ -387,7 +419,10 @@ async function resolveFallbackAfterShot(
   viewportName: "desktop" | "mobile",
   actionsFallbackEnabled: boolean,
   placeholder: string | undefined,
-): Promise<{ url?: string | undefined; png?: Uint8Array | undefined }> {
+): Promise<{ url?: string | undefined; thumbUrl?: string | undefined; png?: Uint8Array | undefined }> {
+  // #6324: never produces a thumbUrl (the actions_fallback artifact is stored as-is, no display downscale
+  // applied) -- typed here purely so this function's return shape matches capturePage's, since buildCapture
+  // uses both interchangeably for the "after" desktop slot.
   if (!actionsFallbackEnabled || !env.REVIEW_AUDIT || !target.headSha) return { url: placeholder };
   const key = await fallbackShotR2Key(target.headSha, path, viewportName);
   const cached = await env.REVIEW_AUDIT.get(key).catch(() => null);
@@ -644,6 +679,8 @@ export async function buildCapture(env: Env, token: string, target: CaptureTarge
         beforeUrlMobile: beforeMobileShot.url,
         afterUrl: afterShot.url,
         afterUrlMobile: afterMobileShot.url,
+        ...(beforeShot.thumbUrl ? { beforeThumbUrl: beforeShot.thumbUrl } : {}),
+        ...(afterShot.thumbUrl ? { afterThumbUrl: afterShot.thumbUrl } : {}),
         ...(diffUrl ? { diffUrl } : {}),
         ...(diffUrlMobile ? { diffUrlMobile } : {}),
         ...(beforeGifUrl ? { beforeGifUrl } : {}),

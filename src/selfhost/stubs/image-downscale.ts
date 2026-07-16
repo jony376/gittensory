@@ -30,3 +30,34 @@ export async function downscaleForVision(png: Uint8Array): Promise<Uint8Array> {
     return png;
   }
 }
+
+/** True in self-host mode -- see image-downscale.ts's module header for why hosted mode can never do this. */
+export function isDisplayDownscaleAvailable(): boolean {
+  return true;
+}
+
+/** Width cap for the DISPLAY thumbnail embedded in the PR-comment table (#6324) -- distinct from
+ *  VISION_MAX_DIMENSION_PX above (a different caller, a different constraint). shot.ts's DESKTOP_VIEWPORT is
+ *  1440px wide; the table embeds the image at `width="360"` (a GitHub-rendered thumbnail), so every viewer's
+ *  browser previously downloaded the full native-resolution capture just to display it shrunk 4x. 720px is
+ *  2x the display width -- sharp enough for a HiDPI/retina viewer, still a real reduction from 1440px (and a
+ *  much larger one for a tall full-page capture, since height scales down proportionally too). */
+const DISPLAY_MAX_WIDTH_PX = 720;
+
+/** Downscale `png` so its width is at most {@link DISPLAY_MAX_WIDTH_PX}, preserving aspect ratio and never
+ *  enlarging an already-narrow image (a mobile-viewport capture, already close to display width, passes
+ *  through unchanged rather than being upscaled). Any decode/resize failure degrades to the ORIGINAL bytes,
+ *  matching downscaleForVision's own "a full-size image beats no image" contract -- capturePage's caller
+ *  falls back to the original URL entirely when this genuinely can't produce a smaller copy, so a failure
+ *  here is never user-visible as a broken image, only as a missed optimization. */
+export async function downscaleForDisplay(png: Uint8Array): Promise<Uint8Array> {
+  try {
+    const resized = await sharp(png)
+      .resize({ width: DISPLAY_MAX_WIDTH_PX, withoutEnlargement: true })
+      .png()
+      .toBuffer();
+    return new Uint8Array(resized);
+  } catch {
+    return png;
+  }
+}

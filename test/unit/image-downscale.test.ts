@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { downscaleForVision } from "../../src/review/visual/image-downscale";
+import { downscaleForDisplay, downscaleForVision, isDisplayDownscaleAvailable } from "../../src/review/visual/image-downscale";
 
 describe("image-downscale Worker-safe default (#4370)", () => {
   it("returns the input bytes unchanged, since the real implementation is self-host only", async () => {
@@ -10,5 +10,21 @@ describe("image-downscale Worker-safe default (#4370)", () => {
   it("returns an empty input unchanged", async () => {
     const empty = new Uint8Array([]);
     await expect(downscaleForVision(empty)).resolves.toBe(empty);
+  });
+});
+
+describe("image-downscale display-copy Worker-safe default (#6324)", () => {
+  it("isDisplayDownscaleAvailable is false -- the real implementation is self-host only", () => {
+    expect(isDisplayDownscaleAvailable()).toBe(false);
+  });
+
+  it("downscaleForDisplay returns the input bytes unchanged", async () => {
+    const png = new Uint8Array([137, 80, 78, 71, 4, 5, 6]);
+    await expect(downscaleForDisplay(png)).resolves.toBe(png);
+  });
+
+  it("downscaleForDisplay returns an empty input unchanged", async () => {
+    const empty = new Uint8Array([]);
+    await expect(downscaleForDisplay(empty)).resolves.toBe(empty);
   });
 });

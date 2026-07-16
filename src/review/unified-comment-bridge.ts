@@ -463,8 +463,11 @@ export function buildBeforeAfterCollapsible(routes: CaptureRoute[]): UnifiedColl
   // previously only present as the invisible `alt` attribute, never rendered as visible text. <br> (not a
   // literal newline, which would break the GFM table row) keeps the caption inside the same cell; <sub> is
   // the same de-emphasized styling this table already uses for its own footer legend line below.
-  const cell = (url: string | undefined, label: string): string =>
-    url ? `<a href="${attr(url)}" target="_blank" rel="noopener"><img width="360" alt="${attr(label)}" src="${attr(url)}"></a><br><sub>${attr(label)}</sub>` : "—";
+  // `imgUrl` (defaults to `url`) is what the <img src> loads; `url` is ALWAYS what the <a href> points at, so
+  // "click to open full-size" keeps resolving to the true original even when a smaller downscaled copy
+  // (route.beforeThumbUrl/afterThumbUrl, self-host only) is embedded inline instead.
+  const cell = (url: string | undefined, label: string, imgUrl: string = url ?? ""): string =>
+    url ? `<a href="${attr(url)}" target="_blank" rel="noopener"><img width="360" alt="${attr(label)}" src="${attr(imgUrl)}"></a><br><sub>${attr(label)}</sub>` : "—";
   const rows: string[] = [];
   let hasAnyDiff = false;
   for (const route of routes) {
@@ -472,7 +475,7 @@ export function buildBeforeAfterCollapsible(routes: CaptureRoute[]): UnifiedColl
     const themeSuffix = route.theme ? ` (${route.theme})` : "";
     if (route.beforeUrl || route.afterUrl) {
       if (route.diffUrl) hasAnyDiff = true;
-      rows.push(`| ${path} | desktop${themeSuffix} | ${cell(route.beforeUrl, `before ${route.path}${themeSuffix}`)} | ${cell(route.afterUrl, `after ${route.path}${themeSuffix}`)} | ${cell(route.diffUrl, `diff ${route.path}${themeSuffix}`)} |`);
+      rows.push(`| ${path} | desktop${themeSuffix} | ${cell(route.beforeUrl, `before ${route.path}${themeSuffix}`, route.beforeThumbUrl)} | ${cell(route.afterUrl, `after ${route.path}${themeSuffix}`, route.afterThumbUrl)} | ${cell(route.diffUrl, `diff ${route.path}${themeSuffix}`)} |`);
     }
     if (route.beforeUrlMobile || route.afterUrlMobile) {
       if (route.diffUrlMobile) hasAnyDiff = true;

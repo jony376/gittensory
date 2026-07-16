@@ -4,7 +4,7 @@
 // / real PNG fixtures here, mirroring test/unit/selfhost-pixel-diff-stub.test.ts's own fixture style.
 import sharp from "sharp";
 import { describe, expect, it } from "vitest";
-import { downscaleForVision } from "../../src/selfhost/stubs/image-downscale";
+import { downscaleForDisplay, downscaleForVision, isDisplayDownscaleAvailable } from "../../src/selfhost/stubs/image-downscale";
 
 async function solidPng(width: number, height: number): Promise<Uint8Array> {
   const buf = await sharp({ create: { width, height, channels: 3, background: { r: 10, g: 20, b: 30 } } })
@@ -46,6 +46,35 @@ describe("selfhost image-downscale stub (#4370)", () => {
   it("degrades to the ORIGINAL bytes (never drops the image) when the input isn't a valid image", async () => {
     const garbage = new Uint8Array([1, 2, 3, 4, 5]);
     const result = await downscaleForVision(garbage);
+    expect(result).toBe(garbage);
+  });
+});
+
+describe("selfhost image-downscale stub, display copy (#6324)", () => {
+  it("isDisplayDownscaleAvailable is true -- this IS the real self-host implementation", () => {
+    expect(isDisplayDownscaleAvailable()).toBe(true);
+  });
+
+  it("downscales a desktop-width capture (1440px, shot.ts's DESKTOP_VIEWPORT) so width is capped at 720, preserving aspect ratio", async () => {
+    const desktopShot = await solidPng(1440, 2397); // the exact dimensions observed live on JSONbored/metagraphed#6036
+    const result = await downscaleForDisplay(desktopShot);
+    const { width, height } = await dimensionsOf(result);
+    expect(width).toBe(720);
+    expect(height).toBe(1199); // round(2397/1440 * 720) = round(1198.5) = 1199
+    expect(result.byteLength).toBeLessThan(desktopShot.byteLength);
+  });
+
+  it("leaves an already-narrow image's dimensions unchanged (withoutEnlargement) -- e.g. a mobile-width capture", async () => {
+    const mobileShot = await solidPng(390, 844);
+    const result = await downscaleForDisplay(mobileShot);
+    const { width, height } = await dimensionsOf(result);
+    expect(width).toBe(390);
+    expect(height).toBe(844);
+  });
+
+  it("degrades to the ORIGINAL bytes (never drops the image) when the input isn't a valid image", async () => {
+    const garbage = new Uint8Array([1, 2, 3, 4, 5]);
+    const result = await downscaleForDisplay(garbage);
     expect(result).toBe(garbage);
   });
 });

@@ -2753,10 +2753,12 @@ export function createApp() {
     if (gate instanceof Response) return gate;
     const current = await getRepositorySettings(c.env, fullName);
     const updated = await upsertRepositorySettings(c.env, { ...current, ...recommendedAdvisoryActivationSettings() });
+    // checkRunMode dropped (Batch A, loopover#6442): recommendedAdvisoryActivationSettings() no longer sets
+    // it (writing it is now a no-op), so echoing updated.checkRunMode here would just always report the
+    // hardcoded default regardless of what this activation actually did.
     return c.json({
       repoFullName: fullName,
       reviewCheckMode: updated.reviewCheckMode,
-      checkRunMode: updated.checkRunMode,
       linkedIssueGateMode: updated.linkedIssueGateMode,
       duplicatePrGateMode: updated.duplicatePrGateMode,
       qualityGateMode: updated.qualityGateMode,

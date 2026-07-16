@@ -2147,7 +2147,14 @@ describe("api routes", () => {
 
   it("serves installation repair diagnostics and refreshes installation health", async () => {
     const app = createApp();
-    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    const env = createTestEnv({
+      GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem(),
+      LOOPOVER_DRIFT_ISSUE_REPO: "unrelated-org/unrelated-repo",
+    });
+    // Isolate the first two /repair calls below from the real JSONbored/gittensory repo's live
+    // .loopover.yml -- this test's intent is pure DB-settings resolution. The later, more specific
+    // fetch stub (for the /refresh flow) replaces this one.
+    vi.stubGlobal("fetch", async () => new Response("not found", { status: 404 }));
     const repoPayload = { name: "gittensory", full_name: "JSONbored/gittensory", private: true, default_branch: "main", owner: { login: "JSONbored" } };
     await upsertInstallation(env, {
       installation: {

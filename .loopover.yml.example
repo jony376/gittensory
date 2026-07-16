@@ -256,7 +256,7 @@ gate:
     - build
     - test
 
-  # Third-party check-runs to treat as ADVISORY (#4372). Any GitHub App you install alongside gittensory
+  # Third-party check-runs to treat as ADVISORY (#4372). Any GitHub App you install alongside loopover
   # (a security scanner, a contributor-trust analyzer, a license/CLA bot, ...) can post a check-run whose
   # terminal conclusion is outside GitHub's normal pass/fail vocabulary — most commonly a durable
   # "action_required" that only a human can clear in that app's own UI, never on GitHub. Left alone, such a
@@ -266,7 +266,7 @@ gate:
   # CI pass/fail entirely and never counts as "still running", so it can never block or stall the gate. It is
   # NOT silently swallowed either — a non-passing conclusion routes the PR to the manual-review hold (the
   # manualReviewLabel) with the triggering check/app named, so a maintainer can act on it. Generic: name the
-  # app(s) YOU run; gittensory hardcodes no vendor. List of { name, appSlug }, or omit. Default: not
+  # app(s) YOU run; loopover hardcodes no vendor. List of { name, appSlug }, or omit. Default: not
   # configured (byte-identical behavior for every repo that doesn't opt in). Config-as-code only — no DB
   # column or dashboard toggle.
   advisoryCheckRuns:

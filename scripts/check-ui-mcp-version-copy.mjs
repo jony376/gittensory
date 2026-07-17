@@ -16,6 +16,10 @@ export const SCAN_TARGETS = [
   "README.md",
   "packages/loopover-mcp/README.md",
   "apps/loopover-ui/src",
+  // The fumadocs-mdx docs content (5003fabe) lives in a sibling directory OUTSIDE src/; check-docs-drift.mjs was
+  // updated for the move but this scanner was not, leaving 10 real .mdx files with @loopover/mcp install snippets
+  // unscanned for stale-version drift (#7093).
+  "apps/loopover-ui/content",
 ];
 
 async function main() {
@@ -142,7 +146,7 @@ export function collectSourceFiles(path) {
 }
 
 export function isTextSource(path) {
-  return /\.(md|ts|tsx|js|jsx|json)$/.test(path);
+  return /\.(md|mdx|ts|tsx|js|jsx|json)$/.test(path);
 }
 
 export function isMinimumSupportedContext(line) {

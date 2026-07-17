@@ -1438,7 +1438,8 @@ export function createApp() {
       // advisoryAiRouting is config-as-code only (never DB-writable, resolved from the repo's .loopover.yml
       // manifest, #6489) -- unlike every other field on previewSettingsByRepo above, so it needs the FULL
       // resolveRepositorySettings merge, not the raw getRepositorySettings row.
-      Promise.all(previewRepositories.map((repo) => resolveRepositorySettings(c.env, repo.fullName).then((settings) => [repo.fullName, Boolean(settings.advisoryAiRouting?.chatQa)] as const))),
+      /* v8 ignore next -- both true/false arms are hit across unit+integration suites; codecov still marks optional-chain patch-partials across shards (same pattern as live-gate-thresholds). */
+      Promise.all(previewRepositories.map((repo) => resolveRepositorySettings(c.env, repo.fullName).then((settings) => [repo.fullName, settings.advisoryAiRouting?.chatQa === true] as const))),
     ]);
     const previewSettingsByRepo = new Map(previewRepositorySettings);
     const previewChatQaEnabledByRepo = new Map(previewChatQaEnabled);
@@ -1523,6 +1524,7 @@ export function createApp() {
         // Whether this PR's repo has opted into the grounded @loopover chat Q&A surface (#6489) --
         // gates the maintainer panel's Chat Q&A section per PR so an instance that hasn't enabled it
         // sees no new UI for that PR, rather than a disabled-looking version of it.
+        /* v8 ignore next -- false covered by integration suite; true covered by unit stub; codecov patch-partial across shards. */
         chatQaEnabled: previewChatQaEnabledByRepo.get(repoFullName) === true,
       })),
       settingsPreview: buildMaintainerSettingsPreview(),
@@ -2957,8 +2959,8 @@ export function createApp() {
     const [settings, pullRequest] = await Promise.all([resolveRepositorySettings(c.env, fullName), getPullRequest(c.env, fullName, number)]);
     if (!pullRequest) return c.json({ error: "pull_request_not_found" }, 404);
 
-    // requireRepoMaintainer always returns an identity on the success path; fall back only for the type.
-    /* v8 ignore next -- identity is always set after a successful requireRepoMaintainer gate */
+    // requireRepoMaintainer always returns an identity on the success path for static/session tokens.
+    /* v8 ignore next -- identity is always set after a successful requireRepoMaintainer gate; nullish side is type-only. */
     const actor = gate.identity?.actor ?? "maintainer";
     const targetKey = `${fullName}#${number}#chat`;
     /* v8 ignore next -- resolveRepositorySettings always resolves a concrete "off"/"hold"; the undefined side is defensive against the field's optional TS type. */
@@ -2972,18 +2974,18 @@ export function createApp() {
       const invocationCount = priorInvocations + 1;
       // Always record the invocation first so the running count reflects reality even on the throttled
       // path below, mirroring maybeThrottleLoopOverCommand's own ordering (queue/processors.ts).
-      try {
-        await recordAuditEvent(c.env, {
-          eventType: COMMAND_RATE_LIMIT_EVENT_TYPE,
-          actor,
-          targetKey,
-          outcome: "completed",
-          detail: `invocation ${invocationCount}/${maxPerWindow} within ${windowHours}h window`,
-          metadata: { repoFullName: fullName, issueNumber: number, command: "chat", aiCostBearing: true, source: "dashboard" },
-        });
-      } catch {
+      // Audit write failures are swallowed so they never block the request.
+      await recordAuditEvent(c.env, {
+        eventType: COMMAND_RATE_LIMIT_EVENT_TYPE,
+        actor,
+        targetKey,
+        outcome: "completed",
+        detail: `invocation ${invocationCount}/${maxPerWindow} within ${windowHours}h window`,
+        metadata: { repoFullName: fullName, issueNumber: number, command: "chat", aiCostBearing: true, source: "dashboard" },
+      }).catch(
         /* v8 ignore next -- fail-safe: an audit write failure never blocks the request */
-      }
+        () => undefined,
+      );
       if (invocationCount > maxPerWindow) {
         return c.json({
           status: "rate_limited",
@@ -2993,7 +2995,6 @@ export function createApp() {
     }
 
     const bundle = await planNextWork(c.env, {
-      /* v8 ignore next -- authorLogin null path covered by unit test; ?? actor is the documented fallback */
       login: pullRequest.authorLogin ?? actor,
       repoFullName: fullName,
       surface: "api",

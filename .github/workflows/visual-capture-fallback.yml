@@ -1,13 +1,13 @@
 name: LoopOver Visual Capture Fallback
 
 # GitHub-Actions build-and-serve FALLBACK for a repo with no CI-produced preview deploy (#4112, part of the
-# #3607 visual-capture convergence epic). gittensory's preview-url.ts discovery chain (Deployments API ->
+# #3607 visual-capture convergence epic). loopover's preview-url.ts discovery chain (Deployments API ->
 # commit-check scan -> bot PR-comment scan) only ever finds a preview that SOME OTHER CI already produced;
 # this workflow is what lets a self-hosted repo with none of that still get an automated "after" screenshot,
 # by having Actions itself build, serve, and capture the PR's own code.
 #
 # Mirrors this repo's OWN ui-preview.yml fork-safety discipline: `contents: read` only, NO secrets anywhere in
-# this job. It is triggered ONLY by `workflow_dispatch`, and ONLY gittensory's own backend dispatches it
+# this job. It is triggered ONLY by `workflow_dispatch`, and ONLY loopover's own backend dispatches it
 # (src/review/visual/actions-fallback.ts, dispatchVisualCaptureFallback) -- always against `ref:
 # <default-branch>`. A `workflow_dispatch` call always runs the DISPATCHED ref's copy of this file, so a
 # contributor can never smuggle a modified workflow definition through their own PR branch (unlike a
@@ -24,13 +24,13 @@ name: LoopOver Visual Capture Fallback
 # regardless of how trusted its source is.
 #
 # Handoff: this job uploads its captured PNGs as a GitHub Actions artifact (`loopover-visual-fallback`) and
-# stops -- it never talks to gittensory directly and holds no credential to do so. On completion, GitHub
-# delivers a `workflow_run` webhook; gittensory's backend then lists + downloads that run's artifact using its
+# stops -- it never talks to loopover directly and holds no credential to do so. On completion, GitHub
+# delivers a `workflow_run` webhook; loopover's backend then lists + downloads that run's artifact using its
 # OWN, already-trusted GitHub App installation token -- never a token that passed through this job.
 #
 # Setup (self-hosted repos only -- NOT needed for loopover-ui / metagraphed, which already have their own
 # preview-deploy pipeline): copy this file, unmodified, into the target repo's `.github/workflows/` at this
-# EXACT path and name (`visual-capture-fallback.yml` / "LoopOver Visual Capture Fallback") -- gittensory's
+# EXACT path and name (`visual-capture-fallback.yml` / "LoopOver Visual Capture Fallback") -- loopover's
 # dispatch call and workflow_run listener both key off this fixed name. Then set `review.visual.actions_fallback:
 # true` in that repo's `.loopover.yml` (see .loopover.yml.example) to opt in; it activates ONLY when the
 # existing discovery chain finds no preview at all, so a repo with its own CI-produced preview is unaffected.
@@ -163,7 +163,7 @@ jobs:
         if: always()
         run: kill "$(cat serve.pid)" 2>/dev/null || true
 
-      # gittensory's backend downloads this by name via its OWN installation token (never a token from this
+      # loopover's backend downloads this by name via its OWN installation token (never a token from this
       # job) once the `workflow_run` completion webhook arrives -- see fetchFallbackArtifactShots.
       - name: Upload captured screenshots
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

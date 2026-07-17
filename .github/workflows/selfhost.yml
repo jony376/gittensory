@@ -66,7 +66,7 @@ jobs:
         image: postgres:18-alpine
         env:
           POSTGRES_PASSWORD: devpw
-          POSTGRES_DB: gittensory
+          POSTGRES_DB: loopover
         ports:
           - 5432:5432
         options: >-
@@ -94,7 +94,7 @@ jobs:
         run: npm run build --workspace @loopover/engine
 
       - name: Postgres integration test (real PG)
-        run: PG_TEST_URL=postgres://postgres:devpw@localhost:5432/gittensory npx vitest run test/integration/selfhost-pg.test.ts
+        run: PG_TEST_URL=postgres://postgres:devpw@localhost:5432/loopover npx vitest run test/integration/selfhost-pg.test.ts
 
       - name: Build the self-host bundle
         run: node scripts/build-selfhost.mjs
@@ -115,11 +115,11 @@ jobs:
             --cache-from type=gha \
             --cache-to type=gha,mode=max \
             --load \
-            -t gittensory:selfhost-ci .
+            -t loopover:selfhost-ci .
 
       - name: Smoke-test bundled AI CLIs
         run: |
-          docker run --rm --entrypoint sh gittensory:selfhost-ci -c \
+          docker run --rm --entrypoint sh loopover:selfhost-ci -c \
             'command -v claude && claude --version && command -v codex && codex --version'
 
       - name: Free disk before visual-review image build
@@ -134,10 +134,10 @@ jobs:
             --build-context selfhost_dist=./dist \
             --build-arg INSTALL_VISUAL_REVIEW=true \
             --load \
-            -t gittensory:selfhost-prebuilt-visual-ci .
-          docker run --rm --entrypoint node gittensory:selfhost-prebuilt-visual-ci \
+            -t loopover:selfhost-prebuilt-visual-ci .
+          docker run --rm --entrypoint node loopover:selfhost-prebuilt-visual-ci \
             -e "import('puppeteer-core').then(() => console.log('puppeteer-core ok'))"
-          docker rmi gittensory:selfhost-prebuilt-visual-ci || true
+          docker rmi loopover:selfhost-prebuilt-visual-ci || true
           docker image prune -f
 
       - name: Boot the container + smoke-test /health, /ready, /metrics, migrations
@@ -153,7 +153,7 @@ jobs:
             -e REDIS_URL=redis://gt-redis:6379 \
             -e SELFHOST_SETUP_TOKEN=selfhost-ci-setup-token \
             -e PUBLIC_API_ORIGIN=https://selfhost-ci.example \
-            gittensory:selfhost-ci
+            loopover:selfhost-ci
           ok=0
           for _ in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8787/health >/dev/null; then ok=1; break; fi

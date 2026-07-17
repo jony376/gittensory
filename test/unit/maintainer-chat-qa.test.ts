@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createApp } from "../../src/api/routes";
-import { recordAuditEvent, upsertInstallation, upsertPullRequestFromGitHub, upsertRepositoryFromGitHub, upsertRepositorySettings } from "../../src/db/repositories";
+import { recordAuditEvent, upsertInstallation, upsertPullRequestFromGitHub, upsertRepositoryFromGitHub } from "../../src/db/repositories";
 import { createTestEnv } from "../helpers/d1";
 
 // #6489 (per #6230's scope decision): the maintainer-dashboard chat Q&A route is a thin wrapper -- build the
@@ -21,11 +21,16 @@ const ADVISORY_ON = { slop: false, e2eTestGen: false, planner: false, summaries:
 // This is a plain, unauthenticated raw.githubusercontent.com read (no installation-token exchange), so no
 // GitHub App private key is needed to stub it -- unlike test/unit/queue-5.test.ts's #4595 chat-dispatch
 // test, which also drives a real GitHub API call downstream and does need one.
-function stubChatQaManifestFetch() {
+// commandRateLimit* is likewise config-as-code only (#6445): DB upserts silently ignore those fields.
+function stubChatQaManifestFetch(options: { rateLimitHoldMax?: number } = {}) {
+  const rateLimitYaml =
+    options.rateLimitHoldMax !== undefined
+      ? `  commandRateLimitPolicy: hold\n  commandRateLimitAiMaxPerWindow: ${options.rateLimitHoldMax}\n  commandRateLimitWindowHours: 24\n`
+      : "";
   vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
     const url = input.toString();
     if (url.includes("raw.githubusercontent.com") && url.includes(".loopover.yml")) {
-      return new Response("settings:\n  advisoryAiRouting:\n    chatQa: true\n", { status: 200 });
+      return new Response(`settings:\n  advisoryAiRouting:\n    chatQa: true\n${rateLimitYaml}`, { status: 200 });
     }
     return new Response("not found", { status: 404 });
   });
@@ -173,7 +178,8 @@ describe("POST /v1/repos/:owner/:repo/pulls/:number/chat-qa (#6489)", () => {
 
     const env = createTestEnv();
     await seedRepoWithPull(env);
-    await upsertRepositorySettings(env, { repoFullName: "owner/repo", commandRateLimitPolicy: "hold", commandRateLimitAiMaxPerWindow: 2, commandRateLimitWindowHours: 24 });
+    // Config-as-code only (#6445): hold + AI ceiling of 2 via .loopover.yml, not upsertRepositorySettings.
+    stubChatQaManifestFetch({ rateLimitHoldMax: 2 });
     // One prior invocation already recorded under the SAME event type + targetKey shape the PR-comment
     // command itself would use for this PR -- e.g. from a real `@loopover chat` comment by this same actor.
     await recordAuditEvent(env, { eventType: "github_app.command_invocation", actor: "api", targetKey: "owner/repo#11#chat", outcome: "completed" });

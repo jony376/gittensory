@@ -5,9 +5,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildStaleVersionMatchers,
+  collectSourceFiles,
   collectVersionCopyFailures,
   isMinimumSupportedContext,
+  isTextSource,
   readMinimumSupportedVersion,
+  SCAN_TARGETS,
   SOURCE_LATEST_PATH,
   writeKnownLatestVersion,
 } from "../../scripts/check-ui-mcp-version-copy.mjs";
@@ -102,6 +105,48 @@ describe("check-ui-mcp-version-copy script (#6292)", () => {
     });
   });
 
+  describe("scanning the fumadocs-mdx content directory (#7093)", () => {
+    let tempDir: string | undefined;
+
+    afterEach(() => {
+      if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+      tempDir = undefined;
+    });
+
+    it("includes the docs content directory and recognizes .mdx as a text source", () => {
+      // Before #7093, SCAN_TARGETS only reached apps/loopover-ui/src and isTextSource didn't match .mdx, so the
+      // fumadocs content pipeline (5003fabe) was entirely invisible to this drift check.
+      expect(SCAN_TARGETS).toContain("apps/loopover-ui/content");
+      expect(isTextSource("apps/loopover-ui/content/docs/quickstart.mdx")).toBe(true);
+    });
+
+    it("collectSourceFiles now picks up real .mdx files under apps/loopover-ui/content/docs", () => {
+      const files = collectSourceFiles(join(root, "apps/loopover-ui/content"));
+      expect(files.some((file) => file.endsWith(join("docs", "quickstart.mdx")))).toBe(true);
+    });
+
+    it("flags a stale @loopover/mcp floor version hardcoded in an .mdx file (the regression this scan now catches)", () => {
+      tempDir = mkdtempSync(join(tmpdir(), "mcp-mdx-"));
+      mkdirSync(join(tempDir, "docs"), { recursive: true });
+      const mdxPath = join(tempDir, "docs", "quickstart.mdx");
+      writeFileSync(mdxPath, "Install with `npx -y @loopover/mcp/0.5.0 --help`\n");
+
+      // Discovery: the .mdx file is collected (it would have been skipped before the isTextSource change).
+      expect(collectSourceFiles(tempDir)).toContain(mdxPath);
+
+      // Flagging: its stale floor version is caught by the same matcher the src/ scan already uses.
+      const matchers = buildStaleVersionMatchers("0.5.0");
+      const failures = collectVersionCopyFailures({
+        label: "docs/quickstart.mdx",
+        text: readFileSync(mdxPath, "utf8"),
+        matchers,
+      });
+      expect(failures).toContain(
+        "docs/quickstart.mdx:1: 0.5.0 is only allowed as an explicit minimum-supported compatibility floor",
+      );
+    });
+  });
+
   it("recognizes minimum-supported context markers", () => {
     expect(
       isMinimumSupportedContext("the minimum supported version is X"),
@@ -170,6 +215,9 @@ describe("check-ui-mcp-version-copy script (#6292)", () => {
     function seedTempRepo(knownLatest: string): string {
       const dir = mkdtempSync(join(tmpdir(), "mcp-write-cli-"));
       mkdirSync(join(dir, "apps/loopover-ui/src/lib"), { recursive: true });
+      // #7093: SCAN_TARGETS now includes apps/loopover-ui/content, so the seeded repo must have it too or the
+      // scan's statSync would ENOENT. Empty is fine — collectSourceFiles returns [] for it.
+      mkdirSync(join(dir, "apps/loopover-ui/content"), { recursive: true });
       mkdirSync(join(dir, "packages/loopover-mcp"), { recursive: true });
       writeFileSync(join(dir, "README.md"), "# repo\n");
       writeFileSync(join(dir, "packages/loopover-mcp/README.md"), "# mcp\n");

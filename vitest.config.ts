@@ -37,8 +37,10 @@ export default defineConfig({
         // bin/loopover-miner-mcp.ts exports createMinerMcpServer, imported in-process by
         // test/unit/miner-mcp-*.test.ts -- genuinely unit-coverable, same as lib/ above. Its sibling
         // bin/loopover-miner.ts (the plain CLI dispatcher: no exports, subprocess-only tested via
-        // test/unit/support/miner-cli-harness.ts) is deliberately NOT graded -- see codecov.yml's ignore
-        // entry for why (same "process entrypoint" reasoning as src/server.ts below).
+        // test/unit/support/miner-cli-harness.ts) is NOT ignore-listed in codecov.yml -- test/unit/
+        // codecov-policy.test.ts (#4864) forbids a blanket exemption for packages/loopover-miner, so it
+        // stays included and genuinely graded (near-0% today) until it either gains real in-process tests
+        // or is refactored into a testable export the way bin/loopover-miner-mcp.ts already was.
         "packages/loopover-miner/bin/**/*.js",
         "packages/loopover-miner/bin/**/*.ts",
         "packages/discovery-index/src/**/*.ts",
@@ -52,8 +54,10 @@ export default defineConfig({
         "packages/loopover-mcp/lib/**/*.ts",
         // packages/loopover-mcp/bin/loopover-mcp.js (~6,600 of ~7,400 lines in the package) is tested
         // exclusively via subprocess spawn (test/unit/mcp-cli-*.test.ts, mcp-discovery.test.ts et al,
-        // through test/unit/support/mcp-cli-harness.ts's execFileSync/StdioClientTransport) -- deliberately
-        // NOT graded, same reasoning as packages/loopover-miner/bin/loopover-miner.ts above; see codecov.yml.
+        // through test/unit/support/mcp-cli-harness.ts's execFileSync/StdioClientTransport). Same shape as
+        // packages/loopover-miner/bin/loopover-miner.ts above -- and, consistent with that file NOT getting
+        // a codecov.yml exemption (#4864), this isn't ignore-listed either: #7291 (the TS migration) will
+        // need real in-process tests or a testable-export refactor for this file, not a free pass.
         "packages/loopover-mcp/bin/**/*.js",
         "packages/loopover-mcp/bin/**/*.ts",
         // review-enrichment is a standalone (non-workspace) package with its own node:test suite; its

@@ -78,12 +78,12 @@ ignore:
   # discovery-index's process entrypoint (#7164) -- same "Docker build+boot, not unit-coverable" reasoning
   # as src/server.ts above; app.ts (everything it wires together) is what tests actually import.
   - "packages/discovery-index/src/server.ts"
-  # CLI process entrypoints: plain top-level dispatchers (no exports, terminate via process.exit()), only
-  # ever exercised as a REAL subprocess (execFileSync/spawnSync/StdioClientTransport spawning "node <bin>
-  # ...args") by test/unit/{miner,mcp}-cli-*.test.ts et al -- v8 coverage can't instrument a separate Node
-  # process, same "not unit-coverable" reasoning as src/server.ts above. Each package's OTHER bin/lib
-  # modules that export real functions and get imported in-process (bin/loopover-miner-mcp.ts's
-  # createMinerMcpServer; packages/loopover-mcp/lib/*.js) are NOT ignored -- only the plain dispatchers are.
-  - "packages/loopover-miner/bin/loopover-miner.ts"
-  - "packages/loopover-mcp/bin/loopover-mcp.js"
-  - "packages/loopover-mcp/bin/loopover-mcp.ts"
+  # NOTE: packages/loopover-miner/bin/loopover-miner.ts and (once #7291 migrates it)
+  # packages/loopover-mcp/bin/loopover-mcp.ts are plain CLI dispatchers (no exports, terminate via
+  # process.exit()) exercised only via real subprocess spawn (test/unit/support/{miner,mcp}-cli-harness.ts),
+  # which v8 coverage can't instrument -- the same shape as src/server.ts above. They are deliberately NOT
+  # listed here: test/unit/codecov-policy.test.ts (#4864) requires packages/loopover-miner to never get a
+  # blanket ignore-list exemption, precisely so a change to the dispatcher forces either real coverage or a
+  # testable-export refactor (the path bin/loopover-miner-mcp.ts's createMinerMcpServer already took)
+  # instead of a silent pass. Both files are still in vitest.config.ts's coverage.include (so a PR that
+  # touches one now genuinely needs to satisfy codecov/patch on it, not skip grading entirely).

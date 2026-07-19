@@ -32,6 +32,7 @@ import { nowIso } from "../utils/json.js";
 import { extractLinkedIssueNumbers } from "../../../../src/db/repositories";
 import { sanitizePublicComment } from "../../../../src/queue-intelligence";
 import { labelMatchesPattern, projectLinkedIssueMultiplierForPlannedSolve, type LinkedIssueMultiplierStatus } from "../scoring/preview.js";
+import { isSuspiciousConfiguredLabel } from "../scoring/label-match.js";
 import { hasLocalTestEvidence, hasValidationNote, isTestPath } from "./test-evidence.js";
 import { isCodeFile, isTestFile } from "./path-matchers.js";
 import { isFailingCheckSummary } from "./check-summary.js";
@@ -1179,7 +1180,7 @@ export function buildLabelAudit(repo: RepositoryRecord | null, repoLabels: RepoL
   // Require a real separator (`:`/`/`/`-`) OR end-of-string after the keyword so this flags prefix-style labels
   // (`status:ready`, `reward/x`) and bare keywords (`bot`) — but NOT mid-word matches like `bottleneck` (`bot`),
   // `scoreboard` (`score`), or `riskier` (`risk`). The old optional+unanchored `[:/-]?` over-matched those.
-  const suspiciousConfiguredLabels = configuredLabels.filter((label) => /^(status|state|source|bot|codex|loopover|reward|score|miner|verified|risk)([:/-]|$)/i.test(label));
+  const suspiciousConfiguredLabels = configuredLabels.filter((label) => isSuspiciousConfiguredLabel(label));
   const findings: SignalFinding[] = [];
   if (repo?.registryConfig?.trustedLabelPipeline && missingConfiguredLabels.length > 0) {
     findings.push({

@@ -196,4 +196,14 @@ describe("bestFitLabels keyword anchoring", () => {
     expect(pick({})).toEqual([]);
     expect(rewardRiskFreshnessInternals.bestFitLabels(null)).toEqual([]);
   });
+
+  it("aligns its meta-label exclusion set to engine.ts's canonical suspicious-label matcher (#7251)", () => {
+    // Keywords the canonical audit excludes that the old divergent copy MISSED are now excluded here too.
+    for (const key of ["state", "bot", "loopover", "reward", "score", "miner"]) {
+      expect(pick({ [`${key}:x`]: 5, bug: 2 })).toEqual(["bug"]);
+    }
+    // `contributor` was wrongly excluded before -- the canonical audit does not treat it as suspicious, so a
+    // high-multiplier contributor:* label must now surface as the best fit instead of being silently dropped.
+    expect(pick({ "contributor:top-tier": 5, bug: 2 })).toEqual(["contributor:top-tier"]);
+  });
 });

@@ -4,6 +4,15 @@ export function labelMatchesPattern(label: string, pattern: string): boolean {
   return labelPatternToRegExp(pattern.toLowerCase()).test(label.toLowerCase());
 }
 
+/** Canonical "meta / suspicious configured-label" keyword matcher (#7251). A configured label multiplier key
+ *  whose keyword matches at a real boundary (`status:ready`, `reward/x`, or bare `bot`) — but NOT mid-word
+ *  (`bottleneck`, `scoreboard`, `riskier`) — is treated as a meta label rather than a genuine work label. Single
+ *  source of truth so engine.ts's `suspiciousConfiguredLabels` audit and reward-risk.ts's `bestFitLabels`
+ *  exclusion can't drift apart the way they already had. */
+export function isSuspiciousConfiguredLabel(label: string): boolean {
+  return /^(status|state|source|bot|codex|loopover|reward|score|miner|verified|risk)([:/-]|$)/i.test(label);
+}
+
 // Compiled fnmatch→RegExp matchers are memoized by pattern. The same small,
 // config-derived set of label keys is matched on every scored PR/issue, so the
 // per-call recompile inside the nested label loops in engine.ts is pure waste.

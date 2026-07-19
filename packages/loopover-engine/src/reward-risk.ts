@@ -8,6 +8,7 @@
 // (#4256).
 import type { ScorePreviewResult } from "./scoring/preview.js";
 import { buildScorePreview } from "./scoring/preview.js";
+import { isSuspiciousConfiguredLabel } from "./scoring/label-match.js";
 import { isFailingCheckSummary } from "./signals/check-summary.js";
 import { nowIso } from "./utils/json.js";
 import type {
@@ -832,11 +833,11 @@ function analysisRank(analysis: RepoRewardRisk): number {
 function bestFitLabels(repo: RepositoryRecord | null): string[] {
   const multipliers = repo?.registryConfig?.labelMultipliers ?? {};
   const labels = Object.entries(multipliers)
-    // Exclude meta labels only at a keyword boundary (a real separator or end-of-string after the keyword),
-    // not mid-word — mirroring the anchored `suspiciousConfiguredLabels` matcher in engine.ts. The old
-    // unanchored regex over-matched substrings (e.g. "opensource" via "source", "risky-refactor" via "risk"),
-    // wrongly dropping a legitimate high-multiplier label from the best-fit suggestion.
-    .filter(([label]) => !/^(status|source|contributor|verified|risk|codex)([:/-]|$)/i.test(label))
+    // Exclude meta labels using the SHARED canonical matcher (#7251) so this can't drift from engine.ts's
+    // `suspiciousConfiguredLabels` audit again -- the two had diverged (this copy was missing
+    // state/bot/loopover/reward/score/miner and wrongly excluded `contributor`, which the canonical audit does
+    // not treat as suspicious).
+    .filter(([label]) => !isSuspiciousConfiguredLabel(label))
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
     .map(([label]) => label);
   return labels.slice(0, 1);

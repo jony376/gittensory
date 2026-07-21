@@ -13,8 +13,17 @@ export {
   type TenantProvisioningRequest,
 } from "./tenant-provisioning-driver.js";
 export {
+  buildTenantProvisioningFailureDedupKey,
+  buildTenantProvisioningFailureSummary,
+  notifyTenantProvisioningFailure,
+  type ProvisioningFailureStep,
+  type ProvisioningPagerDutySeverity,
+  type TriggerPagerDutyIncidentFn,
+} from "./notify-provisioning-failure.js";
+export {
   deprovisionTenant,
   provisionTenant,
+  type ProvisionTenantOptions,
   type TenantDeprovisioningResult,
   type TenantProvisioningResult,
 } from "./provisioning.js";

@@ -3,8 +3,13 @@
 // every driver step but never branched on. Provision runs #7180's three steps in order (create-container,
 // provision-DB, inject-secrets); deprovision tears them down in REVERSE (revoke-secrets, drop-DB,
 // destroy-container) so a secret is never left addressable after the DB/container it belonged to is gone.
+//
+// #7667: a provisioning-step failure pages via src/services/notify-pagerduty.ts's triggerPagerDutyIncident
+// (opt-in via env + LOOPOVER_ENABLE_PAGERDUTY) before rethrowing — best-effort, never blocks teardown.
 
+import { notifyTenantProvisioningFailure, type TriggerPagerDutyIncidentFn } from "./notify-provisioning-failure.js";
 import type {
+  FakeDriverStep,
   Product,
   Tenant,
   TenantLifecycleState,
@@ -27,17 +32,46 @@ export type TenantDeprovisioningResult = {
   state: Extract<TenantLifecycleState, "torn down">;
 };
 
+/** Optional paging context forwarded to notify-pagerduty.ts when a provisioning step throws (#7667). */
+export type ProvisionTenantOptions = {
+  /** Worker Env (or self-host env bag) passed through to triggerPagerDutyIncident. */
+  env?: unknown;
+  /** Repo key for PagerDuty routing; defaults to loopover/hosting. */
+  repoFullName?: string | undefined;
+  /** Test override for triggerPagerDutyIncident — mocks the PagerDuty Events API call. */
+  triggerPagerDuty?: TriggerPagerDutyIncidentFn;
+};
+
+const PROVISION_STEPS: Array<{
+  step: Extract<FakeDriverStep, "createContainer" | "provisionDatabase" | "injectSecrets">;
+  run: (driver: TenantProvisioningDriver, request: TenantProvisioningRequest) => Promise<void>;
+}> = [
+  { step: "createContainer", run: (driver, request) => driver.createContainer(request) },
+  { step: "provisionDatabase", run: (driver, request) => driver.provisionDatabase(request) },
+  { step: "injectSecrets", run: (driver, request) => driver.injectSecrets(request) },
+];
+
 /** Provision a tenant by running #7180's three steps in order against the injected driver. Product-agnostic:
  *  `product` is forwarded to every step, never branched on, so ORB and AMS share one call shape. */
 export async function provisionTenant(
   tenant: Tenant,
   product: Product,
   driver: TenantProvisioningDriver,
+  options: ProvisionTenantOptions = {},
 ): Promise<TenantProvisioningResult> {
   const request: TenantProvisioningRequest = { tenant, product };
-  await driver.createContainer(request);
-  await driver.provisionDatabase(request);
-  await driver.injectSecrets(request);
+  for (const { step, run } of PROVISION_STEPS) {
+    try {
+      await run(driver, request);
+    } catch (error) {
+      await notifyTenantProvisioningFailure(
+        options.env,
+        { tenant, product, step, error, repoFullName: options.repoFullName },
+        { trigger: options.triggerPagerDuty },
+      );
+      throw error;
+    }
+  }
   return { tenant, product, state: "active" };
 }
 
